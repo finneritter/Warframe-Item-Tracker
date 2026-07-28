@@ -20,6 +20,16 @@ pub fn category_of(tags: &[String]) -> Option<&'static str> {
         Some("warframe")
     } else if has("weapon") {
         Some("weapon")
+    } else if has("prime") {
+        // Companion / archwing prime COMPONENTS carry no gear tag at all — only
+        // `sentinel` / `archwing` / `skin` (+ `blueprint`) next to `prime`, while
+        // their sibling parts carry `weapon`. Dropping them cost all six prime
+        // sentinel sets their blueprint (Set premium was inflated by the missing
+        // part) and hid Odonata Prime / Kavasa Prime entirely. Anything still
+        // tagged `prime` here is a tradeable prime part: treat it as `weapon`,
+        // matching the siblings it shares a set with. Non-prime oddments
+        // (necramech, hound, kubrow imprints) stay untracked.
+        Some("weapon")
     } else {
         None
     }
@@ -100,6 +110,45 @@ mod tests {
         assert_eq!(category_of(&tags(&["warframe", "prime"])), Some("warframe"));
         assert_eq!(category_of(&tags(&["weapon", "component"])), Some("weapon"));
         assert_eq!(category_of(&tags(&["sentinel"])), None);
+    }
+
+    /// Prime components whose only type tag is `sentinel`/`archwing`/`skin` must
+    /// still land in the catalog — otherwise their set is short a part.
+    #[test]
+    fn prime_components_without_a_gear_tag_are_kept() {
+        // Dethcube/Carrier/Helios/Nautilus/Shade/Wyrm Prime Blueprint
+        assert_eq!(
+            category_of(&tags(&["blueprint", "prime", "sentinel"])),
+            Some("weapon")
+        );
+        // Odonata Prime Harness/Systems/Wings Blueprint
+        assert_eq!(
+            category_of(&tags(&["archwing", "blueprint", "component", "prime"])),
+            Some("weapon")
+        );
+        // Kavasa Prime Kubrow Collar Blueprint / Band / Buckle
+        assert_eq!(
+            category_of(&tags(&["blueprint", "prime", "skin"])),
+            Some("weapon")
+        );
+        assert_eq!(category_of(&tags(&["prime"])), Some("weapon"));
+        // The real tags still win over the fallback.
+        assert_eq!(
+            category_of(&tags(&["prime", "sentinel", "set"])),
+            Some("set")
+        );
+        assert_eq!(category_of(&tags(&["warframe", "prime"])), Some("warframe"));
+        assert_eq!(
+            category_of(&tags(&["weapon", "component", "prime"])),
+            Some("weapon")
+        );
+        // Non-prime oddments stay untracked.
+        assert_eq!(category_of(&tags(&["component", "necramech"])), None);
+        assert_eq!(
+            category_of(&tags(&["blueprint", "hound", "secondary"])),
+            None
+        );
+        assert_eq!(category_of(&tags(&["imprint", "kubrow", "pet"])), None);
     }
 
     #[test]

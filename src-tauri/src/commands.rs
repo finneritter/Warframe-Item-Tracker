@@ -1971,6 +1971,9 @@ async fn sets_refresh_inner(
     }
     on_progress(total, total);
     if written > 0 {
+        // Membership is authoritative for set_slug, and it only exists now — a
+        // part the slug heuristic mis-derived (Kavasa Prime) is repointed here.
+        catalog::repair_set_slugs(&state.db)?;
         crate::db::meta::set(&state.db, crate::db::meta::KEY_SET_MEMBERSHIP_PASS, "2")?;
     }
     Ok(written)

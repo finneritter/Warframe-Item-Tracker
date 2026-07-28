@@ -111,9 +111,55 @@ pub fn upsert_many(db: &Db, items: &[CatalogUpsert]) -> AppResult<usize> {
                 ])?;
             }
         }
+        // The upsert rewrites set_slug from the slug heuristic every time, so the
+        // repair has to ride along with it rather than run once.
+        repair_set_slugs_tx(&tx)?;
         tx.commit()?;
         Ok(items.len())
     })
+}
+
+/// Repair `set_slug`s the slug heuristic gets wrong. `derive_set_slug` assumes a
+/// set is always named `<stem>_prime_set`, which breaks two ways:
+///   * Kavasa Prime's parts belong to `kavasa_prime_kubrow_collar_set`, so band /
+///     buckle / collar blueprint pointed at a `kavasa_prime_set` that doesn't exist.
+///   * `gotva_prime` is a whole weapon, not a part — it has no set at all.
+///
+/// Both produced phantom rows on the Sets screen. `set_membership` (filled by the
+/// /set pass) is authoritative, so prefer it; a part pointing at a non-existent set
+/// with no membership row loses its set_slug. Idempotent.
+pub fn repair_set_slugs(db: &Db) -> AppResult<usize> {
+    db.with_mut(|conn| {
+        let tx = conn.transaction()?;
+        let n = repair_set_slugs_tx(&tx)?;
+        tx.commit()?;
+        Ok(n)
+    })
+}
+
+fn repair_set_slugs_tx(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<usize> {
+    // Only rows whose set_slug names no real set item are touched — a correct
+    // derivation is left alone, and mod sets (Vigilante &c., never derived) stay
+    // out of the Sets screen.
+    const ORPHANED: &str = "set_slug IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM catalog_items s
+                          WHERE s.slug = catalog_items.set_slug AND s.category = 'set')";
+    let repointed = tx.execute(
+        &format!(
+            "UPDATE catalog_items
+                SET set_slug = (SELECT sm.set_slug FROM set_membership sm
+                                 WHERE sm.part_slug = catalog_items.slug)
+              WHERE {ORPHANED}
+                AND EXISTS (SELECT 1 FROM set_membership sm
+                             WHERE sm.part_slug = catalog_items.slug)"
+        ),
+        [],
+    )?;
+    let cleared = tx.execute(
+        &format!("UPDATE catalog_items SET set_slug = NULL WHERE {ORPHANED}"),
+        [],
+    )?;
+    Ok(repointed + cleared)
 }
 
 /// Current bundled mod-rarity dataset version. Bump alongside
@@ -333,6 +379,75 @@ mod tests {
             thumbnail_url: None,
             wfm_id: None,
         }
+    }
+
+    fn part_of(slug: &str, set_slug: &str) -> CatalogUpsert {
+        CatalogUpsert {
+            set_slug: Some(set_slug.into()),
+            ..up(slug, slug, "weapon")
+        }
+    }
+
+    fn set_slug_of(db: &crate::db::Db, slug: &str) -> Option<String> {
+        db.read(|c| {
+            Ok(c.query_row(
+                "SELECT set_slug FROM catalog_items WHERE slug = ?1",
+                params![slug],
+                |r| r.get::<_, Option<String>>(0),
+            )?)
+        })
+        .unwrap()
+    }
+
+    /// Kavasa Prime's parts derive `kavasa_prime_set`, but the real set item is
+    /// `kavasa_prime_kubrow_collar_set`; `gotva_prime` is a whole weapon with no
+    /// set. Both must stop pointing at a set that doesn't exist.
+    #[test]
+    fn upsert_repairs_phantom_set_slugs() {
+        let db = test_db("catalog-setslug-repair");
+        upsert_many(
+            &db,
+            &[
+                up("kavasa_prime_kubrow_collar_set", "Kavasa Prime Set", "set"),
+                up("saryn_prime_set", "Saryn Prime Set", "set"),
+            ],
+        )
+        .unwrap();
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO set_membership (set_slug, part_slug, quantity_in_set)
+                 VALUES ('kavasa_prime_kubrow_collar_set', 'kavasa_prime_band', 1)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        upsert_many(
+            &db,
+            &[
+                part_of("kavasa_prime_band", "kavasa_prime_set"),
+                part_of("gotva_prime", "gotva_prime_set"),
+                part_of("saryn_prime_chassis", "saryn_prime_set"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            set_slug_of(&db, "kavasa_prime_band").as_deref(),
+            Some("kavasa_prime_kubrow_collar_set"),
+            "membership is authoritative when the derived set is missing"
+        );
+        assert_eq!(
+            set_slug_of(&db, "gotva_prime"),
+            None,
+            "no set item and no membership row -> not a part of anything"
+        );
+        assert_eq!(
+            set_slug_of(&db, "saryn_prime_chassis").as_deref(),
+            Some("saryn_prime_set"),
+            "a correct derivation must be left alone"
+        );
     }
 
     #[test]
