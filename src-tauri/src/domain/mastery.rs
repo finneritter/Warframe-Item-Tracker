@@ -54,7 +54,9 @@ pub fn gear_max_rank(manifest_max: Option<i64>) -> i64 {
 /// guns/melee and sentinel weapons — needs 500×R² and grants 100. The DE inventory
 /// array an entry came from names the class exactly, so it is never guessed from
 /// the item path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Serde: `OwnedGearRaw` (the scan snapshot) carries a class, and that struct is
+// serializable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MasteryClass {
     Frame,
     Weapon,

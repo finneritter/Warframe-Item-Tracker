@@ -2,28 +2,32 @@
 //! extracts the Account data (profile, arsenal, resources, mastery record, intrinsics,
 //! syndicates) that `map.rs` discards. Pure over the `Value` — no I/O, fully tested.
 //! Tolerant in the `map.rs` style (`or_else` casing, `unwrap_or` defaults).
-use super::fingerprint::parse_fingerprint;
+use super::fingerprint::entry_affinity;
+use crate::domain::mastery::MasteryClass;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// DE arsenal array name → normalized category. The array name equals WFCD's
-/// `productCategory`, so these agree with `db::account::category_for`.
-const GEAR_ARRAYS: &[(&str, &str)] = &[
-    ("Suits", "warframe"),
-    ("MechSuits", "necramech"),
-    ("LongGuns", "primary"),
-    ("Pistols", "secondary"),
-    ("Melee", "melee"),
-    ("SpaceSuits", "archwing"),
-    ("SpaceGuns", "archwing"),
-    ("SpaceMelee", "archwing"),
-    ("Sentinels", "companion"),
-    ("SentinelWeapons", "companion"),
-    ("KubrowPets", "companion"),
-    ("MoaPets", "companion"),
-    ("OperatorAmps", "amp"),
-    ("SpecialItems", "special"),
-    ("CrewShipWeapons", "railjack"),
+/// DE arsenal array name → (normalized category, affinity curve). The array name
+/// equals WFCD's `productCategory`, so the categories agree with
+/// `db::account::category_for`. Category and curve differ on purpose: a sentinel
+/// weapon is categorised with companions but ranks like a weapon, and the same goes
+/// for Archwing guns/melee against Archwing frames.
+const GEAR_ARRAYS: &[(&str, &str, MasteryClass)] = &[
+    ("Suits", "warframe", MasteryClass::Frame),
+    ("MechSuits", "necramech", MasteryClass::Frame),
+    ("LongGuns", "primary", MasteryClass::Weapon),
+    ("Pistols", "secondary", MasteryClass::Weapon),
+    ("Melee", "melee", MasteryClass::Weapon),
+    ("SpaceSuits", "archwing", MasteryClass::Frame),
+    ("SpaceGuns", "archwing", MasteryClass::Weapon),
+    ("SpaceMelee", "archwing", MasteryClass::Weapon),
+    ("Sentinels", "companion", MasteryClass::Frame),
+    ("SentinelWeapons", "companion", MasteryClass::Weapon),
+    ("KubrowPets", "companion", MasteryClass::Frame),
+    ("MoaPets", "companion", MasteryClass::Frame),
+    ("OperatorAmps", "amp", MasteryClass::Weapon),
+    ("SpecialItems", "special", MasteryClass::Weapon),
+    ("CrewShipWeapons", "railjack", MasteryClass::Weapon),
 ];
 
 /// DE resource-ish array name → resource `kind`.
@@ -73,7 +77,9 @@ pub struct ProfileRaw {
 pub struct OwnedGearRaw {
     pub unique_name: String,
     pub category: String,
-    pub rank: i64,
+    /// Which affinity curve this array's items follow.
+    pub class: MasteryClass,
+    /// Affinity on the owned copy — resets to 0 on a Forma.
     pub xp: i64,
 }
 
@@ -211,19 +217,19 @@ pub fn parse_account(json: &Value) -> AccountSnapshot {
         training_date,
     };
 
-    // Arsenal: each array's entries → owned gear with rank/xp from the fingerprint.
+    // Arsenal: each array's entries → owned gear with the copy's own affinity.
+    // Rank is derived at store time, where item_manifest supplies the rank ceiling.
     let mut gear = Vec::new();
-    for (key, category) in GEAR_ARRAYS {
+    for (key, category, class) in GEAR_ARRAYS {
         for entry in array(json, key) {
             let Some(unique_name) = item_type(entry) else {
                 continue;
             };
-            let (rank, xp) = parse_fingerprint(entry);
             gear.push(OwnedGearRaw {
                 unique_name,
                 category: category.to_string(),
-                rank,
-                xp,
+                class: *class,
+                xp: entry_affinity(entry),
             });
         }
     }
@@ -341,10 +347,16 @@ mod tests {
                 { "Tag": "NodeC", "Completes": 2 }
             ],
             "Suits": [
-                { "ItemType": "/Lotus/Powersuits/Ninja/Ninja", "UpgradeFingerprint": "{\"lvl\":30,\"xp\":900000}" }
+                { "ItemType": "/Lotus/Powersuits/Ninja/Ninja", "XP": 900000 }
             ],
             "LongGuns": [
-                { "ItemType": "/Lotus/Weapons/Tenno/Rifle/Boltor", "UpgradeFingerprint": "{\"lvl\":12}" }
+                { "ItemType": "/Lotus/Weapons/Tenno/Rifle/Boltor", "XP": 72000 }
+            ],
+            "SentinelWeapons": [
+                { "ItemType": "/Lotus/Types/Sentinels/SentinelWeapons/DethMachineRifle", "XP": 450000 }
+            ],
+            "SpaceGuns": [
+                { "ItemType": "/Lotus/Weapons/Tenno/Archwing/Primary/FoldingMachineGun/ArchMachineGun", "XP": 125000 }
             ],
             "MiscItems": [
                 { "ItemType": "/Lotus/Types/Items/MiscItems/Ferrite", "ItemCount": 4210 }
@@ -388,13 +400,33 @@ mod tests {
     }
 
     #[test]
-    fn arsenal_rank_and_category() {
+    fn arsenal_reads_affinity_and_class() {
         let s = parse_account(&sample());
         let frame = s.gear.iter().find(|g| g.category == "warframe").unwrap();
-        assert_eq!(frame.rank, 30);
-        assert_eq!(frame.xp, 900000);
+        assert_eq!((frame.xp, frame.class), (900_000, MasteryClass::Frame));
         let gun = s.gear.iter().find(|g| g.category == "primary").unwrap();
-        assert_eq!((gun.rank, gun.xp), (12, 0));
+        assert_eq!((gun.xp, gun.class), (72_000, MasteryClass::Weapon));
+        // A sentinel weapon lands in the companion CATEGORY on the weapon CURVE —
+        // the whole reason class is tracked separately from category.
+        let sw = s
+            .gear
+            .iter()
+            .find(|g| g.unique_name.ends_with("DethMachineRifle"))
+            .unwrap();
+        assert_eq!(
+            (sw.category.as_str(), sw.class),
+            ("companion", MasteryClass::Weapon)
+        );
+        // Same for Archwing guns against Archwing frames.
+        let ag = s
+            .gear
+            .iter()
+            .find(|g| g.unique_name.ends_with("ArchMachineGun"))
+            .unwrap();
+        assert_eq!(
+            (ag.category.as_str(), ag.class),
+            ("archwing", MasteryClass::Weapon)
+        );
     }
 
     /// Live check against a real captured blob (set WF_BLOB=/tmp/wf_blob.json). Confirms
