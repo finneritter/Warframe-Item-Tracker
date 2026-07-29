@@ -13,7 +13,7 @@ use crate::types::{
     SyndicateRow,
 };
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -359,14 +359,14 @@ pub fn store_snapshot(db: &Db, snap: &AccountSnapshot) -> AppResult<()> {
     let nodes_total = crate::worldstate::star_chart_node_count() as i64;
     let scanned_at = Utc::now().to_rfc3339();
 
-    // Aggregate duplicates: keep the highest-rank copy of each gear item; sum stacks.
-    let mut gear: HashMap<(String, String), (i64, i64)> = HashMap::new();
+    // Aggregate duplicates: keep the most-levelled copy of each gear item; sum stacks.
+    let mut gear: HashMap<(String, String), (mastery::MasteryClass, i64)> = HashMap::new();
     for g in &snap.gear {
         let e = gear
             .entry((g.unique_name.clone(), g.category.clone()))
-            .or_insert((0, 0));
-        if g.rank >= e.0 {
-            *e = (g.rank, g.xp);
+            .or_insert((g.class, 0));
+        if g.xp >= e.1 {
+            *e = (g.class, g.xp);
         }
     }
     let mut resources: HashMap<String, (String, i64)> = HashMap::new();
@@ -407,11 +407,22 @@ pub fn store_snapshot(db: &Db, snap: &AccountSnapshot) -> AppResult<()> {
             ],
         )?;
         {
+            // Rank is derived here, where item_manifest supplies the ceiling: a Kuva
+            // weapon caps at 40, everything else at 30.
+            let mut max_q =
+                tx.prepare("SELECT max_rank FROM item_manifest WHERE unique_name = ?1")?;
             let mut s = tx.prepare(
-                "INSERT INTO account_gear (unique_name, category, rank, xp) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO account_gear (unique_name, category, mastery_class, rank, xp)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
-            for ((un, cat), (rank, xp)) in &gear {
-                s.execute(params![un, cat, rank, xp])?;
+            for ((un, cat), (class, xp)) in &gear {
+                let m_max: Option<i64> = max_q
+                    .query_row(params![un], |r| r.get(0))
+                    .optional()?
+                    .flatten();
+                let max_rank = mastery::gear_max_rank(m_max);
+                let rank = mastery::rank_from_affinity(*xp, *class, max_rank);
+                s.execute(params![un, cat, class.as_str(), rank, xp])?;
             }
         }
         {
@@ -471,14 +482,17 @@ fn has_snapshot(c: &Connection) -> AppResult<bool> {
     Ok(n > 0)
 }
 
-/// Sum of approximate mastery points across all owned gear.
+/// Sum of approximate mastery points across owned gear. GEAR ONLY: star-chart nodes,
+/// Junctions and Intrinsics also grant mastery and appear nowhere in the scan, so this
+/// runs a few percent under the real total. The displayed MR comes from the scanned
+/// PlayerLevel, which is exact.
 fn total_mastery_points(c: &Connection) -> AppResult<i64> {
-    let mut stmt = c.prepare("SELECT category, rank FROM account_gear")?;
+    let mut stmt = c.prepare("SELECT mastery_class, rank FROM account_gear")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
     let mut total = 0i64;
     for row in rows {
-        let (cat, rank) = row?;
-        total += mastery::mastery_points(&cat, rank);
+        let (class, rank) = row?;
+        total += mastery::mastery_points(mastery::MasteryClass::from_db(&class), rank);
     }
     Ok(total)
 }
@@ -517,13 +531,10 @@ pub fn get_profile(db: &Db) -> AppResult<AccountProfile> {
             });
         }
         let total_points = total_mastery_points(c)?;
-        // Total accumulated affinity ≈ the per-item XPInfo sum; drives MR progress.
-        let total_affinity: i64 = c.query_row(
-            "SELECT COALESCE(SUM(xp), 0) FROM account_mastery",
-            [],
-            |r| r.get(0),
-        )?;
-        let (_, mr_into_next, mr_needed) = mastery::mr_progress(total_affinity);
+        // MR thresholds are 2500 × rank² in mastery POINTS. Feeding the XPInfo affinity
+        // sum in here produced nonsense (billions of affinity → an MR in the hundreds).
+        // Gear-only, so this is a floor on the real progress.
+        let (_, mr_into_next, mr_needed) = mastery::mr_progress(total_points);
 
         let intrinsics = c
             .prepare("SELECT skill_key, rank FROM account_intrinsics ORDER BY skill_key")?
@@ -596,26 +607,37 @@ pub fn get_profile(db: &Db) -> AppResult<AccountProfile> {
 pub fn get_arsenal(db: &Db) -> AppResult<Vec<GearRow>> {
     db.read(|c| {
         let mut stmt = c.prepare(
-            "SELECT g.unique_name, g.category, g.rank,
+            "SELECT g.unique_name, g.category, g.rank, g.mastery_class, g.xp,
                     m.display_name, m.icon_path, m.max_rank, m.mastery_req,
-                    ci.slug, ci.display_name, ci.thumbnail_url
+                    ci.slug, ci.display_name, ci.thumbnail_url,
+                    am.xp
              FROM account_gear g
              LEFT JOIN item_manifest m ON m.unique_name = g.unique_name
-             LEFT JOIN catalog_items ci ON ci.game_ref = g.unique_name",
+             LEFT JOIN catalog_items ci ON ci.game_ref = g.unique_name
+             LEFT JOIN account_mastery am ON am.unique_name = g.unique_name",
         )?;
         let rows = stmt
             .query_map([], |r| {
                 let unique_name: String = r.get(0)?;
                 let category: String = r.get(1)?;
                 let rank: i64 = r.get(2)?;
-                let m_name: Option<String> = r.get(3)?;
-                let icon_path: Option<String> = r.get(4)?;
-                let m_max: Option<i64> = r.get(5)?;
-                let mastery_req: Option<i64> = r.get(6)?;
-                let slug: Option<String> = r.get(7)?;
-                let c_name: Option<String> = r.get(8)?;
-                let thumb: Option<String> = r.get(9)?;
+                let class_str: String = r.get(3)?;
+                let copy_xp: i64 = r.get(4)?;
+                let m_name: Option<String> = r.get(5)?;
+                let icon_path: Option<String> = r.get(6)?;
+                let m_max: Option<i64> = r.get(7)?;
+                let mastery_req: Option<i64> = r.get(8)?;
+                let slug: Option<String> = r.get(9)?;
+                let c_name: Option<String> = r.get(10)?;
+                let thumb: Option<String> = r.get(11)?;
+                let lifetime_xp: Option<i64> = r.get(12)?;
                 let max_rank = mastery::gear_max_rank(m_max);
+                let class = mastery::MasteryClass::from_db(&class_str);
+                // Mastery is permanent; the copy's affinity is not. Prefer the XPInfo
+                // ledger, and fall back to the copy for an item with no ledger row
+                // (never equipped, or scanned before XPInfo existed).
+                let lifetime = lifetime_xp.unwrap_or(copy_xp).max(copy_xp);
+                let mastered = mastery::is_mastered(lifetime, class, max_rank);
                 let display_name = c_name
                     .or(m_name)
                     .unwrap_or_else(|| name_from_path(&unique_name));
@@ -628,7 +650,7 @@ pub fn get_arsenal(db: &Db) -> AppResult<Vec<GearRow>> {
                     slug,
                     rank,
                     max_rank,
-                    mastered: mastery::is_mastered(rank, max_rank),
+                    mastered,
                     mastery_req,
                 })
             })?
@@ -707,24 +729,37 @@ pub fn get_codex(db: &Db) -> AppResult<CodexData> {
         // Owned + mastered per category (manifest items the player actually has).
         let mut owned: HashMap<String, (i64, i64)> = HashMap::new();
         {
+            // Mastered is decided per row in Rust, on the same lifetime-affinity rule
+            // the Arsenal badge uses — `g.rank >= m.max_rank` would drop a Forma'd item
+            // out of the count, and the curve constants belong in `domain::mastery`,
+            // not in SQL.
             let mut stmt = c.prepare(
-                "SELECT m.category, COUNT(*),
-                        SUM(CASE WHEN g.rank >= m.max_rank THEN 1 ELSE 0 END)
+                "SELECT m.category, m.max_rank, g.mastery_class, g.xp, am.xp
                  FROM item_manifest m
                  JOIN account_gear g ON g.unique_name = m.unique_name
-                 WHERE m.max_rank IS NOT NULL
-                 GROUP BY m.category",
+                 LEFT JOIN account_mastery am ON am.unique_name = g.unique_name
+                 WHERE m.max_rank IS NOT NULL",
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
                 ))
             })?;
             for row in rows {
-                let (cat, own, mastered) = row?;
-                owned.insert(cat, (own, mastered));
+                let (cat, m_max, class_str, copy_xp, lifetime_xp) = row?;
+                let lifetime = lifetime_xp.unwrap_or(copy_xp).max(copy_xp);
+                let mastered = mastery::is_mastered(
+                    lifetime,
+                    mastery::MasteryClass::from_db(&class_str),
+                    mastery::gear_max_rank(m_max),
+                );
+                let e = owned.entry(cat).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += i64::from(mastered);
             }
         }
         let mut categories: Vec<CodexCategory> = totals
@@ -810,6 +845,7 @@ mod tests {
 
     #[test]
     fn store_snapshot_round_trips_through_readers() {
+        use crate::domain::mastery::MasteryClass;
         use crate::gamescan::account::{OwnedGearRaw, OwnedStackRaw, ProfileRaw, XpRow};
         let db = crate::db::testutil::test_db("acct-roundtrip");
         seed_if_empty_or_stale(&db).unwrap(); // manifest = the Codex denominator
@@ -836,7 +872,7 @@ mod tests {
             gear: vec![OwnedGearRaw {
                 unique_name: frame_un.clone(),
                 category: "warframe".into(),
-                rank: 30,
+                class: MasteryClass::Frame,
                 xp: 900_000,
             }],
             resources: vec![OwnedStackRaw {
@@ -880,5 +916,97 @@ mod tests {
         assert_eq!(wf.owned, 1);
         assert_eq!(wf.mastered, 1);
         assert!(wf.total > 50, "manifest denominator for warframes");
+    }
+
+    /// The bug this file exists to fix: a Forma'd frame reads rank 0 but must stay
+    /// mastered, and a sentinel weapon must rank on the WEAPON curve despite sitting
+    /// in the "companion" category.
+    #[test]
+    fn arsenal_ranks_the_copy_and_masters_from_lifetime_affinity() {
+        use crate::domain::mastery::MasteryClass;
+        use crate::gamescan::account::{OwnedGearRaw, XpRow};
+        let db = crate::db::testutil::test_db("acct-rank-mastery");
+        seed_if_empty_or_stale(&db).unwrap();
+
+        let pick = |sql: &str| -> String {
+            db.with(|c| Ok(c.query_row(sql, [], |r| r.get::<_, String>(0))?))
+                .unwrap()
+        };
+        let frame_un = pick(
+            "SELECT unique_name FROM item_manifest
+              WHERE category = 'warframe' AND COALESCE(max_rank, 30) = 30 LIMIT 1",
+        );
+        let sentinel_weapon_un = pick(
+            "SELECT unique_name FROM item_manifest
+              WHERE unique_name LIKE '%/SentinelWeapons/%' LIMIT 1",
+        );
+        let rifle_un = pick(
+            "SELECT unique_name FROM item_manifest
+              WHERE category = 'primary' AND COALESCE(max_rank, 30) = 30 LIMIT 1",
+        );
+
+        let snap = AccountSnapshot {
+            gear: vec![
+                // Freshly Forma'd: no affinity on the copy, but mastered for life.
+                OwnedGearRaw {
+                    unique_name: frame_un.clone(),
+                    category: "warframe".into(),
+                    class: MasteryClass::Frame,
+                    xp: 0,
+                },
+                // 450k on the WEAPON curve is rank 30; on the frame curve it would be 21.
+                OwnedGearRaw {
+                    unique_name: sentinel_weapon_un.clone(),
+                    category: "companion".into(),
+                    class: MasteryClass::Weapon,
+                    xp: 450_000,
+                },
+                // Half-levelled and never mastered.
+                OwnedGearRaw {
+                    unique_name: rifle_un.clone(),
+                    category: "primary".into(),
+                    class: MasteryClass::Weapon,
+                    xp: 72_000,
+                },
+            ],
+            mastery: vec![XpRow {
+                unique_name: frame_un.clone(),
+                xp: 900_000,
+            }],
+            ..Default::default()
+        };
+        store_snapshot(&db, &snap).unwrap();
+
+        let rows = get_arsenal(&db).unwrap();
+        let frame = rows.iter().find(|r| r.unique_name == frame_un).unwrap();
+        assert_eq!(frame.rank, 0, "the Forma'd copy is rank 0");
+        assert!(frame.mastered, "lifetime affinity keeps it mastered");
+
+        let sw = rows
+            .iter()
+            .find(|r| r.unique_name == sentinel_weapon_un)
+            .unwrap();
+        assert_eq!(sw.rank, 30, "sentinel weapons rank on the weapon curve");
+        assert!(
+            sw.mastered,
+            "no XPInfo row -> fall back to the copy's affinity"
+        );
+
+        let rifle = rows.iter().find(|r| r.unique_name == rifle_un).unwrap();
+        assert_eq!(rifle.rank, 12, "72000 / 500 = 144 -> rank 12");
+        assert!(!rifle.mastered);
+
+        // Gear-only mastery points: 0 + 30*100 + 12*100.
+        assert_eq!(get_profile(&db).unwrap().total_mastery_points, 4_200);
+
+        // The Codex counts the same mastery the Arsenal badges do — the Forma'd
+        // frame must not drop out of it just because its copy is back at rank 0.
+        let codex = get_codex(&db).unwrap();
+        let wf = codex
+            .categories
+            .iter()
+            .find(|c| c.category == "warframe")
+            .unwrap();
+        assert_eq!(wf.mastered, 1, "Forma'd frame stays mastered in the Codex");
     }
 }
