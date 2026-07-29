@@ -157,6 +157,18 @@ async fn real_scan() -> AppResult<ScanResult> {
         })?;
 
     let json = api::fetch_inventory(&session.account_id, &session.nonce).await?;
+    // Opt-in raw capture for debugging the parser against reality (the field shapes
+    // are undocumented and have burned us before). Local disk only, never uploaded.
+    if std::env::var("WFIT_GAMESCAN_DUMP").is_ok() {
+        let path = std::env::temp_dir().join("wfit-inventory-blob.json");
+        match serde_json::to_vec_pretty(&json)
+            .map_err(|e| e.to_string())
+            .and_then(|b| std::fs::write(&path, b).map_err(|e| e.to_string()))
+        {
+            Ok(()) => tracing::info!(path = %path.display(), "gamescan: dumped raw inventory blob"),
+            Err(e) => tracing::warn!(error = %e, "gamescan: blob dump failed"),
+        }
+    }
     let mut inv = map::parse_inventory(&json);
     inv.account_id = Some(session.account_id.clone()); // trust the scanned id over the body
     let mut acct = account::parse_account(&json);
