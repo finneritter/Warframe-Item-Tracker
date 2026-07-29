@@ -4,7 +4,7 @@
 //! The manifest follows the `db::relic_data` pattern exactly: a bundled TSV seeds the
 //! table (re-seeded when the bundle version bumps), and "Update game data" refreshes it
 //! from the live WFCD `warframe-items` JSON. Everything here is a rebuildable cache.
-use crate::db::{meta, Db};
+use crate::db::{catalog, meta, Db};
 use crate::domain::mastery;
 use crate::error::AppResult;
 use crate::gamescan::account::AccountSnapshot;
@@ -606,16 +606,18 @@ pub fn get_profile(db: &Db) -> AppResult<AccountProfile> {
 /// The Arsenal tab payload: owned gear resolved to name/icon/slug, with mastered state.
 pub fn get_arsenal(db: &Db) -> AppResult<Vec<GearRow>> {
     db.read(|c| {
-        let mut stmt = c.prepare(
+        // One catalog row per gear row — `game_ref` is not unique (see PICK_SLUG_FOR_GAME_REF).
+        let mut stmt = c.prepare(&format!(
             "SELECT g.unique_name, g.category, g.rank, g.mastery_class, g.xp,
                     m.display_name, m.icon_path, m.max_rank, m.mastery_req,
                     ci.slug, ci.display_name, ci.thumbnail_url,
                     am.xp
              FROM account_gear g
              LEFT JOIN item_manifest m ON m.unique_name = g.unique_name
-             LEFT JOIN catalog_items ci ON ci.game_ref = g.unique_name
+             LEFT JOIN catalog_items ci ON ci.slug = ({})
              LEFT JOIN account_mastery am ON am.unique_name = g.unique_name",
-        )?;
+            catalog::pick_slug_sql("g.unique_name")
+        ))?;
         let rows = stmt
             .query_map([], |r| {
                 let unique_name: String = r.get(0)?;
@@ -662,14 +664,15 @@ pub fn get_arsenal(db: &Db) -> AppResult<Vec<GearRow>> {
 /// The Resources tab payload: every owned stack resolved to name/icon.
 pub fn get_resources(db: &Db) -> AppResult<Vec<ResourceRow>> {
     db.read(|c| {
-        let mut stmt = c.prepare(
+        let mut stmt = c.prepare(&format!(
             "SELECT r.unique_name, r.kind, r.count,
                     m.display_name, m.icon_path,
                     ci.slug, ci.display_name, ci.thumbnail_url
              FROM account_resources r
              LEFT JOIN item_manifest m ON m.unique_name = r.unique_name
-             LEFT JOIN catalog_items ci ON ci.game_ref = r.unique_name",
-        )?;
+             LEFT JOIN catalog_items ci ON ci.slug = ({})",
+            catalog::pick_slug_sql("r.unique_name")
+        ))?;
         let rows = stmt
             .query_map([], |r| {
                 let unique_name: String = r.get(0)?;
@@ -1008,5 +1011,79 @@ mod tests {
             .find(|c| c.category == "warframe")
             .unwrap();
         assert_eq!(wf.mastered, 1, "Forma'd frame stays mastered in the Codex");
+    }
+
+    /// warframe.market can carry two catalog items with the SAME `gameRef` (a legacy
+    /// listing plus the current one — `prisma_shade` / `prisma_shade_set`). The
+    /// catalog join must not fan one owned item out into several identical rows: the
+    /// Arsenal/Resources tables key React rows by unique_name, so duplicates corrupt
+    /// the rendered list when the category filter changes.
+    #[test]
+    fn duplicate_game_refs_do_not_duplicate_owned_rows() {
+        use crate::domain::mastery::MasteryClass;
+        use crate::gamescan::account::{OwnedGearRaw, OwnedStackRaw};
+        let db = crate::db::testutil::test_db("acct-dup-gameref");
+        seed_if_empty_or_stale(&db).unwrap();
+
+        let sentinel_un = db
+            .with(|c| {
+                Ok(c.query_row(
+                    "SELECT unique_name FROM item_manifest WHERE category = 'companion' LIMIT 1",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )?)
+            })
+            .unwrap();
+        let resource_un = "/Lotus/Types/Items/MiscItems/Ferrite";
+
+        // Two catalog rows per game_ref, exactly as the live catalog holds them.
+        db.with_mut(|tx| {
+            for (slug, name, gref) in [
+                ("dup_thing", "Dup Thing", sentinel_un.as_str()),
+                ("dup_thing_set", "Dup Thing Set", sentinel_un.as_str()),
+                ("dup_res", "Dup Res", resource_un),
+                ("dup_res_alt", "Dup Res Alt", resource_un),
+            ] {
+                tx.execute(
+                    "INSERT INTO catalog_items
+                       (slug, display_name, part_type, category, game_ref)
+                     VALUES (?1, ?2, 'Set', 'set', ?3)",
+                    rusqlite::params![slug, name, gref],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        store_snapshot(
+            &db,
+            &AccountSnapshot {
+                gear: vec![OwnedGearRaw {
+                    unique_name: sentinel_un.clone(),
+                    category: "companion".into(),
+                    class: MasteryClass::Frame,
+                    xp: 900_000,
+                }],
+                resources: vec![OwnedStackRaw {
+                    unique_name: resource_un.into(),
+                    kind: "resource".into(),
+                    count: 4210,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let arsenal = get_arsenal(&db).unwrap();
+        assert_eq!(arsenal.len(), 1, "one owned sentinel -> one Arsenal row");
+        assert_eq!(
+            arsenal[0].slug.as_deref(),
+            Some("dup_thing_set"),
+            "gear trades as a set — prefer the _set listing, deterministically"
+        );
+
+        let resources = get_resources(&db).unwrap();
+        assert_eq!(resources.len(), 1, "one owned stack -> one Resources row");
+        assert_eq!(resources[0].slug.as_deref(), Some("dup_res"));
     }
 }

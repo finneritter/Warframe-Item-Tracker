@@ -23,6 +23,21 @@ pub struct CatalogUpsert {
     pub thumbnail_url: Option<String>,
 }
 
+/// `game_ref` is NOT unique: warframe.market keeps a legacy listing alongside the
+/// current one for a few items (`prisma_shade` and `prisma_shade_set` share a
+/// `gameRef`). Any join on it fans one owned item out into several identical rows,
+/// so every read must pick exactly one. The rule, in one place: prefer the `_set`
+/// listing (owned gear trades as a set), then the lexicographically first slug.
+/// `{0}` is the column holding the DE uniqueName to resolve.
+pub const PICK_SLUG_FOR_GAME_REF: &str = "SELECT c2.slug FROM catalog_items c2
+      WHERE c2.game_ref = {0}
+      ORDER BY (substr(c2.slug, -4) = '_set') DESC, c2.slug LIMIT 1";
+
+/// The `PICK_SLUG_FOR_GAME_REF` subquery bound to a concrete column.
+pub fn pick_slug_sql(game_ref_col: &str) -> String {
+    PICK_SLUG_FOR_GAME_REF.replace("{0}", game_ref_col)
+}
+
 pub fn count(db: &Db) -> AppResult<i64> {
     db.read(|c| {
         let n: i64 = c.query_row("SELECT COUNT(*) FROM catalog_items", [], |r| r.get(0))?;

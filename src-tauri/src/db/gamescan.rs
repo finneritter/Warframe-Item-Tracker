@@ -88,10 +88,15 @@ pub fn record_scan(db: &Db, account_id: Option<&str>) -> AppResult<()> {
 }
 
 /// `game_ref` (DE uniqueName) → catalog slug. The join the scan mapping rides on.
+/// A `game_ref` can carry two catalog rows, so the ORDER BY makes the last write
+/// win the same slug the Arsenal picks (see `catalog::PICK_SLUG_FOR_GAME_REF`) —
+/// without it the mapping was whichever row the scan happened to read last.
 pub fn game_ref_to_slug(db: &Db) -> AppResult<HashMap<String, String>> {
     db.with(|c| {
-        let mut stmt =
-            c.prepare("SELECT game_ref, slug FROM catalog_items WHERE game_ref IS NOT NULL")?;
+        let mut stmt = c.prepare(
+            "SELECT game_ref, slug FROM catalog_items WHERE game_ref IS NOT NULL
+              ORDER BY (substr(slug, -4) = '_set') ASC, slug DESC",
+        )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         let mut m = HashMap::new();
         for r in rows {
