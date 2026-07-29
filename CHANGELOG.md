@@ -3,6 +3,37 @@
 All notable changes to WFIT are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] — 2026-07-29 · arsenal ranks + open-world vendors
+
+- **Arsenal Rank and Mastery are filled in.** Every scanned item read
+  `0/30` and no mastery badge, because the scan looked for rank in a
+  field only mods and arcanes carry. Rank now comes from the owned
+  copy's affinity, and the mastered badge from your lifetime affinity
+  ledger — so a freshly Forma'd frame correctly shows `0/30` and stays
+  mastered. `is:mastered` and `rank:<10` in the search bar work against
+  real numbers now. The Codex's mastered counts were wrong the same way
+  and agree with the Arsenal again. Note the "total mastery" figure
+  counts gear only: star-chart nodes, Junctions and Intrinsics aren't in
+  the scan data, so it reads a little under your in-game MR (the MR
+  itself is read directly and is exact).
+- **Prime sentinel and archwing sets are whole again.** warframe.market
+  tags Dethcube/Carrier/Helios/Nautilus/Shade/Wyrm Prime blueprints in a
+  way that dropped them from the catalog, so those sets were missing a
+  part — which understated "parts sold loose" and inflated the set
+  premium. Odonata Prime and Kavasa Prime never appeared at all. All 13
+  items are back.
+- **No more duplicated rows in the Armory.** A few items (Prisma Shade)
+  have two warframe.market listings sharing one game id, which produced
+  two identical rows and corrupted the table when you switched category
+  tabs quickly — rows from the previous tab could stay on screen.
+- **Open-world vendors.** New Cetus, Fortuna and Deimos tabs on the
+  Vendors board, plus an Eleanor Coda-rotation column.
+- **The relic-crack overlay reads per card.** Alt+T now lays out one
+  panel per reward card in a top-center strip, marks its pick with the
+  reason, keeps duplicate rewards from a radshare distinct, and shows
+  which cards it couldn't read instead of silently dropping them. It
+  also refreshes its relic vocabulary when a card matches nothing.
+
 ## [1.5.0] — 2026-07-17 · relic OCR + home resources
 
 - **Relic-crack reward prices, on screen (#2).** Press **Alt+T** on the
