@@ -23,7 +23,8 @@ use tauri_plugin_updater::UpdaterExt;
 
 /// Release feed. One source of truth for both the plugin path and the fallback
 /// GET; `WFIT_UPDATE_ENDPOINT` overrides it for local chain testing.
-const ENDPOINT: &str = "https://github.com/finneritter/WFIT/releases/latest/download/latest.json";
+const ENDPOINT: &str =
+    "https://github.com/finneritter/Warframe-Item-Tracker/releases/latest/download/latest.json";
 /// Daily background cadence + a warmup so launch traffic (catalog/price drain)
 /// isn't competing with a same-instant update check.
 const CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
