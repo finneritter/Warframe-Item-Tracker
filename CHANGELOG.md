@@ -3,6 +3,38 @@
 All notable changes to WFIT are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.7.0] — 2026-08-03 · listings sync tells you the truth
+
+- **Connecting your warframe.market account works for everyone now.**
+  warframe.market identifies you by your *profile address*, not your
+  in-game name, and the two aren't always the same. WFIT was asking for
+  the name — so for anyone whose profile address differs, the site
+  answered "no such user", WFIT read that as "no orders", and the
+  Listings screen sat empty forever while looking perfectly healthy.
+  It now looks your profile up and confirms it's actually yours before
+  saving it. If the name alone can't find you, paste your profile URL
+  and that settles it. This affected anyone whose profile address isn't
+  simply their lowercased name, and has been broken since v1.1.
+- **Sync says what it did.** "No open orders" and "we couldn't match any
+  of your orders" used to look identical — both silently reported
+  success. Each now reports itself, along with how many orders WFIT
+  doesn't track (rivens and the like).
+- **Your listings can't quietly disappear any more.** A sync that
+  fetches orders but matches none of them, or one that runs before the
+  item catalog has downloaded, no longer empties the Listings screen.
+  Neither does an expired session: without one, warframe.market only
+  shows your *visible* orders, so an empty answer is no longer taken as
+  proof you have none — WFIT keeps what it has and tells you to
+  reconnect to be sure.
+- **The profile link opens the right page.** The warframe.market links
+  on the Account screen used your in-game name, which 404s for the same
+  reason as above. They use the real profile address now.
+- **Removed: importing listings into inventory.** It seeded inventory
+  from what you'd *posted for sale*, which was never the same as what
+  you own, and the game scan does the real job. The Listings screen is
+  now purely a read-only mirror of your orders.
+- **The full set links to warframe.market** from the set drawer.
+
 ## [1.6.0] — 2026-07-29 · arsenal ranks + open-world vendors
 
 - **Arsenal Rank and Mastery are filled in.** Every scanned item read
