@@ -39,7 +39,7 @@ pub mod wfm;
 /// The schema version the MIGRATIONS list produces (`PRAGMA user_version` after
 /// `to_latest`). Bump in lockstep when appending a migration — the pre-migration
 /// backup gate and its test both pin it.
-pub const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 22;
 
 // Append future migrations here; never edit a shipped one.
 static MIGRATIONS: Lazy<Migrations<'static>> = Lazy::new(|| {
@@ -71,6 +71,7 @@ static MIGRATIONS: Lazy<Migrations<'static>> = Lazy::new(|| {
         M::up(include_str!(
             "../../migrations/0021_account_gear_mastery_class.sql"
         )),
+        M::up(include_str!("../../migrations/0022_wfm_account_slug.sql")),
     ])
 });
 

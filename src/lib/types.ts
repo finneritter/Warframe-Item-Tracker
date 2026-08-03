@@ -323,9 +323,13 @@ export interface ItemSellers {
 }
 
 export interface WfmAccount {
+  /** In-game name, spelled the way warframe.market spells it. Display only. */
   username: string | null;
+  /** The warframe.market profile slug — what /v2/orders/user/<…> and /profile/<…>
+   *  take. NOT a lowercase of `username` (collisions get an unguessable numeric
+   *  suffix). Null on a pre-0022 install until the next connect/sync resolves it. */
+  slug: string | null;
   status: string | null;
-  last_import_at: string | null;
   connected: boolean;
   has_session: boolean;
   session_expires_at: string | null;
@@ -360,13 +364,13 @@ export interface ListingRow {
   thumbnail_url: string | null;
 }
 
-export interface ImportRow {
-  slug: string;
-  display_name: string;
-  part_type: string;
-  listed_qty: number;
-  your_price: number | null;
-  current_qty: number;
+/** What a listings sync actually did (1:1 with Rust `SyncResult`). Distinguishes
+ *  "you have no open orders" (fetched 0) from "we matched none of them" — the two
+ *  used to look identical, i.e. like nothing happening at all. */
+export interface SyncResult {
+  fetched: number;
+  mirrored: number;
+  untracked: number;
 }
 
 export interface RecommendationRow {

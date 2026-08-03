@@ -87,13 +87,15 @@ export function Account({ onOpen, onNavigate }: { onOpen: OpenFn; onNavigate: Na
         <Emblem size={64} />
         <div className="acc-id">
           <div className="acc-name">{name}</div>
-          {wfm?.username ? (
+          {/* The URL takes the profile *slug*, not the in-game name — /profile/<name>
+              404s for anyone whose name isn't already its own slug. */}
+          {wfm?.slug ? (
             <button
               type="button"
               className="acc-handle lnk"
-              onClick={() => openExternal(`https://warframe.market/profile/${wfm.username}`)}
+              onClick={() => openExternal(`https://warframe.market/profile/${wfm.slug}`)}
             >
-              warframe.market/profile/{wfm.username} ↗
+              warframe.market/profile/{wfm.slug} ↗
             </button>
           ) : (
             <span className="acc-handle">not connected to warframe.market</span>
@@ -128,7 +130,7 @@ export function Account({ onOpen, onNavigate }: { onOpen: OpenFn; onNavigate: Na
       <div className="acc-cols">
         <AboutCol profile={profile} ign={name} />
         <AccountCol profile={profile} />
-        <LinksCol username={wfm?.username ?? null} />
+        <LinksCol slug={wfm?.slug ?? null} />
       </div>
 
       {/* tab bar */}
@@ -320,15 +322,15 @@ function AccountCol({ profile }: { profile?: AccountProfile }) {
   );
 }
 
-function LinksCol({ username }: { username: string | null }) {
+function LinksCol({ slug }: { slug: string | null }) {
   return (
     <div>
       <div className="acc-secH">Links</div>
-      {username ? (
+      {slug ? (
         <button
           type="button"
           className="acc-info lnk"
-          onClick={() => openExternal(`https://warframe.market/profile/${username}`)}
+          onClick={() => openExternal(`https://warframe.market/profile/${slug}`)}
         >
           <Stroke d={ICON.link} />
           <span>warframe.market profile ↗</span>

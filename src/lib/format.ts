@@ -1,6 +1,7 @@
 // Presentation helpers ported from the wireframe.
 
 import { loadPrefs } from "./prefs";
+import type { SyncResult } from "./types";
 
 export const clsx = (...a: (string | false | null | undefined)[]) => a.filter(Boolean).join(" ");
 
@@ -86,6 +87,18 @@ export const syncedAgo = (iso: string | null): string => {
   const hrs = Math.floor(mins / 60);
   if (hrs < 24) return `${hrs}h`;
   return `${Math.floor(hrs / 24)}d`;
+};
+
+/** One-line outcome of a listings sync. A sync that matched nothing must never
+ *  read the same as a sync that found nothing — that ambiguity is what made a
+ *  broken Sync look like an idle one. */
+export const syncListingsNote = (r: SyncResult): string => {
+  const s = (n: number) => (n === 1 ? "" : "s");
+  if (r.fetched === 0) return "No open orders on warframe.market";
+  if (r.mirrored === 0)
+    return `warframe.market returned ${r.fetched} order${s(r.fetched)}, none of them items WFIT tracks — your listings were left as they were`;
+  const base = `Synced ${r.mirrored} listing${s(r.mirrored)}`;
+  return r.untracked > 0 ? `${base} · ${r.untracked} not tracked by WFIT` : base;
 };
 
 /** ms remaining until an ISO timestamp (negative if past). */

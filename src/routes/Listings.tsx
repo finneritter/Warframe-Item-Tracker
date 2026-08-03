@@ -11,7 +11,6 @@ import {
   useRecommendationsRefresh,
   useSearchCatalog,
   useWfmAccount,
-  useWfmApplyImport,
   useWfmConnect,
   useWfmCreateOrder,
   useWfmDeleteOrder,
@@ -24,12 +23,13 @@ import {
   useWfmUpdateOrder,
 } from "../hooks/queries";
 import { useEscape } from "../hooks/useEscape";
-import { wfmFetchListings, wfmRepricePreview } from "../lib/api";
-import { CATEGORY_LABELS, clsx, fmt } from "../lib/format";
+import { wfmRepricePreview } from "../lib/api";
+import { CATEGORY_LABELS, clsx, fmt, syncListingsNote } from "../lib/format";
 import { usePageSearch } from "../lib/searchContext";
 import { compileQuery } from "../lib/searchQuery";
 import { listingsSchema, recommendationsSchema } from "../lib/searchSchemas";
-import type { ImportRow, InventoryRow, ListingRow, RepriceRow } from "../lib/types";
+import { pushToast } from "../lib/toast";
+import type { InventoryRow, ListingRow, RepriceRow } from "../lib/types";
 
 // Sort axes for the Recommended tab.
 const REC_SORTS: readonly DropdownOption[] = [
@@ -167,7 +167,9 @@ function NewListingModal({
   );
 }
 
-/** Step 1 of 2: connect by public username (validated against warframe.market). */
+/** Step 1 of 2: connect by public profile name (resolved + verified against
+ *  warframe.market). The API addresses users by their profile *slug*, which isn't
+ *  always the in-game name, so pasting the profile URL is offered as the sure path. */
 function SignInCard() {
   const connect = useWfmConnect();
   const [username, setUsername] = useState("");
@@ -186,12 +188,13 @@ function SignInCard() {
       </div>
       <div className="content" style={{ padding: 14 }}>
         <p className="muted" style={{ marginTop: 0 }}>
-          Imports your warframe.market <b>listings</b>, read-only. Enter your public username.
+          Mirrors your warframe.market <b>listings</b>, read-only. Enter your profile name — or
+          paste your profile URL if the name alone doesn't find you.
         </p>
         <div className="search" style={{ marginBottom: 8 }}>
           <input
             autoFocus
-            placeholder="warframe.market username"
+            placeholder="profile name or warframe.market/profile/… URL"
             value={username}
             onChange={(e) => setUsername(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && submit()}
@@ -278,76 +281,6 @@ function SessionCard({ onSkip }: { onSkip: () => void }) {
             {(setSession.error as Error).message}
           </div>
         ) : null}
-      </div>
-    </div>
-  );
-}
-
-function ImportPanel({ rows, onClose }: { rows: ImportRow[]; onClose: () => void }) {
-  const apply = useWfmApplyImport();
-  const [sel, setSel] = useState<Record<string, number>>(
-    Object.fromEntries(rows.map((r) => [r.slug, r.listed_qty])),
-  );
-  return (
-    <div className="tpanel">
-      <div className="tpanel-h">
-        <h3>Review import — listings, not inventory</h3>
-        <span style={{ flex: 1 }} />
-        <button type="button" className="x" onClick={onClose}>
-          ✕
-        </button>
-      </div>
-      <table className="dtable">
-        <thead>
-          <tr>
-            <th>Item</th>
-            <th className="r">Listed</th>
-            <th className="r">Have now</th>
-            <th className="r">Import qty</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r) => (
-            <tr key={r.slug}>
-              <td>{r.display_name}</td>
-              <td className="r">{r.listed_qty}</td>
-              <td className="r">{r.current_qty}</td>
-              <td className="r">
-                <input
-                  type="number"
-                  style={{
-                    width: 48,
-                    background: "var(--panel)",
-                    color: "var(--ink)",
-                    border: "1px solid var(--line-2)",
-                  }}
-                  value={sel[r.slug] ?? 0}
-                  onChange={(e) =>
-                    setSel((s) => ({ ...s, [r.slug]: Number.parseInt(e.target.value, 10) || 0 }))
-                  }
-                />
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      <div className="modal-f">
-        <div className="info">Merge keeps your larger manual counts.</div>
-        <span className="sp" style={{ flex: 1 }} />
-        <button
-          type="button"
-          className="btn pri"
-          onClick={() =>
-            apply.mutate(
-              Object.entries(sel)
-                .filter(([, q]) => q > 0)
-                .map(([slug, qty]) => ({ slug, qty })),
-              { onSuccess: onClose },
-            )
-          }
-        >
-          Import selected
-        </button>
       </div>
     </div>
   );
@@ -684,7 +617,6 @@ export function Listings({
   const update = useWfmUpdateOrder();
   const del = useWfmDeleteOrder();
   const markSold = useWfmMarkSold();
-  const [importRows, setImportRows] = useState<ImportRow[] | null>(null);
   const [repriceRows, setRepriceRows] = useState<RepriceRow[] | null>(null);
   const [repricing, setRepricing] = useState(false);
   // The item being created — slug, plus an optional rank when opened from a per-rank
@@ -792,17 +724,14 @@ export function Listings({
         <button
           type="button"
           className="btn sm"
-          onClick={() => sync.mutate()}
+          onClick={() =>
+            sync.mutate(undefined, {
+              onSuccess: (r) => pushToast(syncListingsNote(r), "info"),
+            })
+          }
           disabled={sync.isPending}
         >
           {sync.isPending ? "Syncing…" : "Sync"}
-        </button>
-        <button
-          type="button"
-          className="btn sm"
-          onClick={async () => setImportRows(await wfmFetchListings())}
-        >
-          Import
         </button>
         <button type="button" className="btn sm" onClick={() => signout.mutate()}>
           Disconnect
@@ -812,8 +741,6 @@ export function Listings({
       {setStatus.isError ? (
         <div className="conn-note">Couldn't set status: {(setStatus.error as Error).message}</div>
       ) : null}
-
-      {importRows ? <ImportPanel rows={importRows} onClose={() => setImportRows(null)} /> : null}
 
       {repriceRows ? (
         <RepricePanel rows={repriceRows} onClose={() => setRepriceRows(null)} />

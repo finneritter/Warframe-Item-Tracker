@@ -334,8 +334,6 @@ pub fn run() {
             commands::wfm_signout,
             commands::wfm_sync_listings,
             commands::wfm_get_listings,
-            commands::wfm_fetch_listings,
-            commands::wfm_apply_import,
             commands::wfm_create_order,
             commands::wfm_update_order,
             commands::wfm_delete_order,
@@ -777,7 +775,7 @@ fn spawn_price_heartbeat(state: Arc<AppState>, app: tauri::AppHandle) {
             // Listings mirror rides along occasionally (a single API call).
             if tick % LISTINGS_SYNC_TICKS == 0 {
                 match commands::sync_listings_impl(&state).await {
-                    Ok(n) => changed += n,
+                    Ok(r) => changed += r.mirrored,
                     Err(error::AppError::NotConnected(_)) => {} // no account — fine
                     Err(e) => tracing::warn!(error = %e, "heartbeat listings sync failed"),
                 }

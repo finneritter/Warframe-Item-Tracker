@@ -1,9 +1,10 @@
-use crate::db::wfm::{ImportApply, ListingMirror};
+use crate::db::wfm::ListingMirror;
 use crate::db::{
     account, buylist, catalog, gamescan as gamescan_db, inventory, meta, prices, recommend,
     relic_data, relics, sales, sets, settings, trends, vault, vendor, vendor_checkoff, wanted,
     watchlist, wfm,
 };
+use crate::domain::wfm_slug;
 use crate::error::{AppError, AppResult};
 use crate::gamescan;
 use crate::types::*;
@@ -1508,19 +1509,114 @@ pub fn get_wfm_account(state: State<'_, Arc<AppState>>) -> AppResult<WfmAccount>
     Ok(acct)
 }
 
-/// Tier 1: connect by public username. Validates by fetching visible orders.
+/// Case-insensitive name compare. `to_lowercase` (not `eq_ignore_ascii_case`) so
+/// non-Latin in-game names fold correctly too.
+fn name_eq(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
+/// Resolve the warframe.market profile **slug** for whatever the user typed,
+/// returning `(slug, ingame_name)`.
+///
+/// warframe.market addresses users by slug, and the slug is not a derivable
+/// lowercase of the in-game name: collisions get an unguessable numeric suffix
+/// ("Deepsea_" is "deepsea-0265") while the obvious guess is a DIFFERENT real
+/// account ("deepsea" is "-DeepSea-"). So every derived candidate is verified
+/// against the profile's own `ingameName` before it is accepted — mirroring a
+/// stranger's order book is a far worse failure than an actionable error.
+///
+/// Two inputs skip verification because they *are* authoritative: `/v2/me` (the
+/// session's own profile) and a pasted profile URL (the user told us the slug).
+async fn resolve_wfm_identity(
+    market: &crate::market::Market,
+    typed: &str,
+    jwt: Option<&str>,
+) -> AppResult<(String, String)> {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        return Err(AppError::Invalid(
+            "enter your warframe.market profile name".into(),
+        ));
+    }
+
+    // 1. A session knows exactly who it belongs to — no guessing needed.
+    if let Some(token) = jwt {
+        match market.fetch_me(token).await {
+            Ok(Some(u)) => return Ok((u.slug, u.ingame_name)),
+            Ok(None) => tracing::debug!("/v2/me gave no recognisable profile — falling back"),
+            // A stale token must not block a Tier-1 connect.
+            Err(e) => tracing::debug!(error = %e, "/v2/me failed — falling back to public lookup"),
+        }
+    }
+
+    // 2. A pasted profile URL already contains the slug.
+    if let Some(slug) = wfm_slug::slug_from_profile_url(typed) {
+        return match market.fetch_user(&slug).await? {
+            Some(u) => Ok((u.slug, u.ingame_name)),
+            None => Err(AppError::NotFound(format!(
+                "warframe.market has no profile at that URL (\"{slug}\")."
+            ))),
+        };
+    }
+
+    // 3. Probe the derivable candidates, accepting only a verified name match.
+    let mut mismatch: Option<(String, String)> = None;
+    for candidate in wfm_slug::slug_candidates(typed) {
+        let Some(u) = market.fetch_user(&candidate).await? else {
+            continue;
+        };
+        if name_eq(&u.ingame_name, typed) {
+            return Ok((u.slug, u.ingame_name));
+        }
+        mismatch.get_or_insert((candidate, u.ingame_name));
+    }
+
+    Err(AppError::NotFound(match mismatch {
+        Some((slug, other)) => format!(
+            "warframe.market/profile/{slug} belongs to \"{other}\", not \"{typed}\". \
+             Open YOUR profile on warframe.market and paste the address-bar URL here — \
+             a profile's address isn't always its in-game name."
+        ),
+        None => format!(
+            "warframe.market has no profile for \"{typed}\". Open your profile on \
+             warframe.market and copy the name out of the URL \
+             (warframe.market/profile/<this-part>), or paste the whole URL here."
+        ),
+    }))
+}
+
+/// The connected account's profile slug, self-healing a pre-0022 install (which
+/// stored only the in-game name) by resolving it once and persisting it. EVERY
+/// `/v2/orders/user/...` call goes through this — never through `acct.username`.
+async fn connected_slug(state: &Arc<AppState>) -> AppResult<String> {
+    let acct = wfm::get_account(&state.db)?;
+    let username = acct
+        .username
+        .ok_or_else(|| AppError::NotConnected("not connected".into()))?;
+    if let Some(slug) = acct.slug.filter(|s| !s.is_empty()) {
+        return Ok(slug);
+    }
+    let jwt = wfm_account::load_jwt()?;
+    let (slug, name) = resolve_wfm_identity(&state.market, &username, jwt.as_deref()).await?;
+    wfm::set_account(&state.db, &name, &slug, None)?;
+    tracing::info!(%slug, "backfilled the warframe.market profile slug");
+    Ok(slug)
+}
+
+/// Tier 1: connect by public profile name or pasted profile URL.
 #[tauri::command]
 pub async fn wfm_connect(
     state: State<'_, Arc<AppState>>,
     username: String,
 ) -> AppResult<WfmAccount> {
-    let username = username.trim().to_string();
-    if username.is_empty() {
-        return Err(AppError::Invalid("username is empty".into()));
-    }
-    // A successful (even empty) fetch confirms the profile is reachable.
-    let _ = state.market.fetch_user_orders(&username, None).await?;
-    wfm::set_account(&state.db, &username, Some("online"))?;
+    let typed = username.trim().to_string();
+    let jwt = wfm_account::load_jwt()?;
+    let (slug, ingame_name) = resolve_wfm_identity(&state.market, &typed, jwt.as_deref()).await?;
+    tracing::info!(%typed, %slug, %ingame_name, "resolved warframe.market profile");
+    // Resolving the profile IS the validation — deliberately NOT gated on the
+    // orders call. A new account legitimately has zero orders, and conflating the
+    // two is exactly what let a mis-cased name connect and then sync nothing.
+    wfm::set_account(&state.db, &ingame_name, &slug, Some("online"))?;
     get_wfm_account(state)
 }
 
@@ -1535,12 +1631,17 @@ pub async fn wfm_set_session(
         .ok_or_else(|| AppError::NotConnected("connect a username first".into()))?;
     // Validate against an authenticated endpoint so a bad/expired token is caught now,
     // not later on the first write (the public orders endpoint can't tell us this).
-    state
+    let me = state
         .market
         .fetch_me(jwt.trim())
         .await
         .map_err(|e| AppError::Invalid(format!("session token rejected: {e}")))?;
     wfm_account::store_jwt(jwt.trim())?;
+    // The session knows its own profile — take the authoritative name/slug over
+    // whatever Tier 1 resolved (or failed to resolve).
+    if let Some(u) = me {
+        wfm::set_account(&state.db, &u.ingame_name, &u.slug, None)?;
+    }
     get_wfm_account(state)
 }
 
@@ -1555,25 +1656,33 @@ pub fn wfm_signout(state: State<'_, Arc<AppState>>) -> AppResult<()> {
 
 /// Refresh the read-only listings mirror from warframe.market.
 #[tauri::command]
-pub async fn wfm_sync_listings(state: State<'_, Arc<AppState>>) -> AppResult<usize> {
+pub async fn wfm_sync_listings(state: State<'_, Arc<AppState>>) -> AppResult<SyncResult> {
     sync_listings_impl(state.inner()).await
 }
 
 /// Command body, callable without a `State` wrapper — the live heartbeat
 /// (`lib.rs`) piggybacks a listings sync on its tick every ~10 min.
-pub(crate) async fn sync_listings_impl(state: &Arc<AppState>) -> AppResult<usize> {
-    let acct = wfm::get_account(&state.db)?;
-    let username = acct
-        .username
-        .ok_or_else(|| AppError::NotConnected("not connected".into()))?;
+pub(crate) async fn sync_listings_impl(state: &Arc<AppState>) -> AppResult<SyncResult> {
+    let slug = connected_slug(state).await?;
     let jwt = wfm_account::load_jwt()?;
     let orders = state
         .market
-        .fetch_user_orders(&username, jwt.as_deref())
+        .fetch_user_orders(&slug, jwt.as_deref())
         .await?;
+    let fetched = orders.len();
 
     // Resolve warframe.market item ids -> our catalog slugs; drop untracked items.
     let id_to_slug = catalog::id_slug_map(&state.db)?;
+    // An empty map means the catalog hasn't downloaded yet: every order would look
+    // "untracked" and the mirror would be wiped with a success return.
+    if id_to_slug.is_empty() {
+        return Err(AppError::Other(
+            "the item catalog hasn't downloaded yet, so WFIT can't match your orders to \
+             items. Wait for the first catalog sync to finish, then sync again."
+                .into(),
+        ));
+    }
+
     let mirror: Vec<ListingMirror> = orders
         .into_iter()
         .filter_map(|o| {
@@ -1588,58 +1697,35 @@ pub(crate) async fn sync_listings_impl(state: &Arc<AppState>) -> AppResult<usize
             })
         })
         .collect();
-    wfm::replace_listings(&state.db, &mirror)
+
+    let untracked = fetched - mirror.len();
+    if untracked > 0 {
+        tracing::info!(fetched, untracked, %slug, "listings sync dropped untracked orders");
+    }
+    // Orders exist but none of them are items WFIT tracks (rivens, relics, …) —
+    // keep whatever the mirror already holds rather than silently emptying it.
+    if mirror.is_empty() && fetched > 0 {
+        tracing::warn!(
+            fetched,
+            "every fetched order was untracked — mirror left untouched"
+        );
+        return Ok(SyncResult {
+            fetched,
+            mirrored: wfm::count_listings(&state.db)?,
+            untracked,
+        });
+    }
+    let mirrored = wfm::replace_listings(&state.db, &mirror, fetched)?;
+    Ok(SyncResult {
+        fetched,
+        mirrored,
+        untracked,
+    })
 }
 
 #[tauri::command]
 pub fn wfm_get_listings(state: State<'_, Arc<AppState>>) -> AppResult<Vec<ListingRow>> {
     wfm::list_listings(&state.db)
-}
-
-/// Preview the import: map current orders to catalog rows. Does NOT write.
-#[tauri::command]
-pub async fn wfm_fetch_listings(state: State<'_, Arc<AppState>>) -> AppResult<Vec<ImportRow>> {
-    let acct = wfm::get_account(&state.db)?;
-    let username = acct
-        .username
-        .ok_or_else(|| AppError::NotConnected("not connected".into()))?;
-    let jwt = wfm_account::load_jwt()?;
-    let orders = state
-        .market
-        .fetch_user_orders(&username, jwt.as_deref())
-        .await?;
-
-    let id_to_slug = catalog::id_slug_map(&state.db)?;
-    let mut out = Vec::new();
-    for o in orders {
-        if o.order_type != "sell" {
-            continue;
-        }
-        let Some(slug) = id_to_slug.get(&o.item_id) else {
-            continue;
-        };
-        if let Some(r) = catalog::get(&state.db, slug)? {
-            out.push(ImportRow {
-                slug: r.slug,
-                display_name: r.display_name,
-                part_type: r.part_type,
-                listed_qty: o.quantity.unwrap_or(1),
-                your_price: o.platinum,
-                current_qty: r.owned_qty,
-            });
-        }
-    }
-    Ok(out)
-}
-
-#[tauri::command]
-pub fn wfm_apply_import(
-    state: State<'_, Arc<AppState>>,
-    rows: Vec<ImportApply>,
-) -> AppResult<usize> {
-    let n = wfm::apply_import(&state.db, &rows)?;
-    wfm::mark_imported(&state.db)?;
-    Ok(n)
 }
 
 // ---------------------------------------------------------------------------
@@ -1695,7 +1781,7 @@ pub async fn wfm_create_order(
         )
         .await
         .inspect_err(|e| tracing::warn!(error = %e, "wfm_create_order failed"))?;
-    sync_listings_impl(state.inner()).await
+    Ok(sync_listings_impl(state.inner()).await?.mirrored)
 }
 
 /// Edit an existing order's price / quantity / visibility, then re-sync the mirror.
@@ -1718,7 +1804,7 @@ pub async fn wfm_update_order(
         .market
         .update_order(&jwt, &order_id, platinum, quantity, visible)
         .await?;
-    sync_listings_impl(state.inner()).await
+    Ok(sync_listings_impl(state.inner()).await?.mirrored)
 }
 
 /// Delete an order, then re-sync the mirror.
@@ -1729,7 +1815,7 @@ pub async fn wfm_delete_order(
 ) -> AppResult<usize> {
     let jwt = require_jwt()?;
     state.market.delete_order(&jwt, &order_id).await?;
-    sync_listings_impl(state.inner()).await
+    Ok(sync_listings_impl(state.inner()).await?.mirrored)
 }
 
 /// Mark one unit of a listing sold: drop the order's quantity by 1 on
@@ -1788,7 +1874,7 @@ pub async fn wfm_mark_sold(state: State<'_, Arc<AppState>>, order_id: String) ->
     };
     sales::record_sold(&state.db, &slug, price, &members)?;
 
-    sync_listings_impl(state.inner()).await
+    Ok(sync_listings_impl(state.inner()).await?.mirrored)
 }
 
 /// Set the account's market presence so orders show active to buyers. warframe.market
@@ -1825,14 +1911,11 @@ pub fn get_recommended_price(
 /// Rows whose item has no price signal are skipped. Does NOT write anything.
 #[tauri::command]
 pub async fn wfm_reprice_preview(state: State<'_, Arc<AppState>>) -> AppResult<Vec<RepriceRow>> {
-    let acct = wfm::get_account(&state.db)?;
-    let username = acct
-        .username
-        .ok_or_else(|| AppError::NotConnected("not connected".into()))?;
+    let slug = connected_slug(state.inner()).await?;
     let jwt = wfm_account::load_jwt()?;
     let orders = state
         .market
-        .fetch_user_orders(&username, jwt.as_deref())
+        .fetch_user_orders(&slug, jwt.as_deref())
         .await?;
     let id_to_slug = catalog::id_slug_map(&state.db)?;
 
@@ -2469,4 +2552,61 @@ pub async fn install_app_update(app: tauri::AppHandle) -> AppResult<()> {
 #[tauri::command]
 pub fn restart_app(app: tauri::AppHandle) -> AppResult<()> {
     app.restart()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Live probe (`cargo test -- --ignored resolve_identity`) for the exact path
+    /// that was broken: warframe.market addresses users by profile slug, so the
+    /// in-game name has to be resolved and verified, not lowercased.
+    ///
+    /// "Nadarejin" is a long-lived public profile (72 open orders when this was
+    /// written). If it ever disappears, swap in any name off an order book —
+    /// `GET /v2/orders/item/<slug>` exposes both `user.ingameName` and `user.slug`.
+    #[tokio::test]
+    #[ignore = "hits the live warframe.market API"]
+    async fn resolve_identity_probe() {
+        let market = crate::market::Market::new();
+
+        // The in-game name, mis-cased exactly the way a user would type it.
+        let (slug, name) = resolve_wfm_identity(&market, "Nadarejin", None)
+            .await
+            .expect("should resolve the in-game name to a slug");
+        assert_eq!(slug, "nadarejin");
+        assert_eq!(name, "Nadarejin");
+
+        // A pasted profile URL is authoritative — including a suffixed slug that
+        // no amount of derivation could produce.
+        let (slug, name) = resolve_wfm_identity(
+            &market,
+            "https://warframe.market/profile/deepsea-0265",
+            None,
+        )
+        .await
+        .expect("a pasted profile URL should resolve");
+        assert_eq!(slug, "deepsea-0265");
+        assert_eq!(name, "Deepsea_");
+
+        // The collision hazard: "Deepsea_" derives to "deepsea", which is a real
+        // but DIFFERENT account. Verification must reject it rather than mirror a
+        // stranger's order book.
+        let err = resolve_wfm_identity(&market, "Deepsea_", None)
+            .await
+            .expect_err("must not accept a same-slug different-user match");
+        let msg = err.to_string();
+        assert!(msg.contains("deepsea"), "{msg}");
+
+        // And the orders call itself must now fail loudly on the un-slugged name.
+        let err = market
+            .fetch_user_orders("Nadarejin", None)
+            .await
+            .expect_err("the in-game name 404s and must not look like zero orders");
+        assert!(err.to_string().contains("no profile"), "{err}");
+
+        // The resolved slug does return orders.
+        let orders = market.fetch_user_orders("nadarejin", None).await.unwrap();
+        assert!(!orders.is_empty(), "expected public orders for nadarejin");
+    }
 }

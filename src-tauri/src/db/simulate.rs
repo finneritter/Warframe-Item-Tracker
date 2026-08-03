@@ -272,10 +272,13 @@ pub fn simulate(db: &Db, db_path: &Path, fill: i64) -> AppResult<SimSummary> {
             ],
         )?;
 
-        // --- Profile name: `random_user`. ---
+        // --- Profile name: `random_user`. The slug must be set too, or the first
+        // sync would try to resolve it against the live API (commands::connected_slug).
         tx.execute(
-            "INSERT INTO wfm_account (id, username, status) VALUES (1, 'random_user', 'simulated')
-             ON CONFLICT(id) DO UPDATE SET username = 'random_user', status = 'simulated'",
+            "INSERT INTO wfm_account (id, username, slug, status)
+             VALUES (1, 'random_user', 'random-user', 'simulated')
+             ON CONFLICT(id) DO UPDATE SET
+                username = 'random_user', slug = 'random-user', status = 'simulated'",
             [],
         )?;
 

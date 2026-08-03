@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useGameScanPreview, useGameScanStatus, useWfmAccount, useWfmSync } from "../hooks/queries";
-import { clsx } from "../lib/format";
+import { clsx, syncListingsNote } from "../lib/format";
 import type { ScanDiffRow } from "../lib/types";
 import { ReviewPanel, errMessage } from "./GameScanPanel";
 import { Icon } from "./Icon";
@@ -38,8 +38,7 @@ export function SyncNow() {
     // modal carries the result). Both run concurrently; one failing doesn't
     // stop the other.
     const jobs: Promise<string | null>[] = [];
-    if (canListings)
-      jobs.push(wfmSync.mutateAsync().then((n) => `${n} listing${n === 1 ? "" : "s"}`));
+    if (canListings) jobs.push(wfmSync.mutateAsync().then(syncListingsNote));
     if (canScan)
       jobs.push(
         preview.mutateAsync().then((rows) => {

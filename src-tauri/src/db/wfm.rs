@@ -1,5 +1,5 @@
 use crate::db::Db;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::types::{ListingRow, WfmAccount};
 use chrono::Utc;
 use rusqlite::params;
@@ -10,7 +10,7 @@ pub fn get_account(db: &Db) -> AppResult<WfmAccount> {
     db.with(|c| {
         let row = c
             .query_row(
-                "SELECT username, status, last_import_at FROM wfm_account WHERE id = 1",
+                "SELECT username, slug, status FROM wfm_account WHERE id = 1",
                 [],
                 |r| {
                     Ok((
@@ -22,19 +22,19 @@ pub fn get_account(db: &Db) -> AppResult<WfmAccount> {
             )
             .ok();
         Ok(match row {
-            Some((username, status, last_import_at)) => WfmAccount {
+            Some((username, slug, status)) => WfmAccount {
                 connected: username.is_some(),
                 username,
+                slug,
                 status,
-                last_import_at,
                 has_session: false,
                 session_expires_at: None,
                 session_expired: false,
             },
             None => WfmAccount {
                 username: None,
+                slug: None,
                 status: None,
-                last_import_at: None,
                 connected: false,
                 has_session: false,
                 session_expires_at: None,
@@ -44,14 +44,18 @@ pub fn get_account(db: &Db) -> AppResult<WfmAccount> {
     })
 }
 
-pub fn set_account(db: &Db, username: &str, status: Option<&str>) -> AppResult<()> {
+/// Store the resolved account. `username` is the in-game name for display;
+/// `slug` is the warframe.market profile slug every API call is addressed by —
+/// they are NOT interchangeable (see `domain::wfm_slug`), so both are required.
+pub fn set_account(db: &Db, username: &str, slug: &str, status: Option<&str>) -> AppResult<()> {
     db.with(|c| {
         c.execute(
-            "INSERT INTO wfm_account (id, username, status) VALUES (1, ?1, ?2)
+            "INSERT INTO wfm_account (id, username, slug, status) VALUES (1, ?1, ?2, ?3)
              ON CONFLICT(id) DO UPDATE SET
                 username = excluded.username,
+                slug = excluded.slug,
                 status = COALESCE(excluded.status, wfm_account.status)",
-            params![username, status],
+            params![username, slug, status],
         )?;
         Ok(())
     })
@@ -63,16 +67,6 @@ pub fn set_status(db: &Db, status: &str) -> AppResult<()> {
         c.execute(
             "UPDATE wfm_account SET status = ?1 WHERE id = 1",
             params![status],
-        )?;
-        Ok(())
-    })
-}
-
-pub fn mark_imported(db: &Db) -> AppResult<()> {
-    db.with(|c| {
-        c.execute(
-            "UPDATE wfm_account SET last_import_at = ?1 WHERE id = 1",
-            params![Utc::now().to_rfc3339()],
         )?;
         Ok(())
     })
@@ -98,7 +92,19 @@ pub struct ListingMirror {
 }
 
 /// Replace the listings mirror wholesale (it reflects warframe.market's truth).
-pub fn replace_listings(db: &Db, listings: &[ListingMirror]) -> AppResult<usize> {
+///
+/// `fetched` is how many orders the API actually returned, which is what tells
+/// "you have no orders" (fetched 0 — a genuine empty, wipe away) apart from "we
+/// resolved none of them" (fetched N, mapped 0 — the catalog hasn't synced, or
+/// every order is an item WFIT doesn't track). The second case used to DELETE the
+/// whole mirror and report success. `sync_listings_impl` already short-circuits
+/// it; this is the backstop so a future caller can't reintroduce it.
+pub fn replace_listings(db: &Db, listings: &[ListingMirror], fetched: usize) -> AppResult<usize> {
+    if listings.is_empty() && fetched > 0 {
+        return Err(AppError::Invalid(format!(
+            "refusing to clear the listings mirror: {fetched} orders fetched, 0 matched the catalog"
+        )));
+    }
     db.with_mut(|conn| {
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM market_listings", [])?;
@@ -163,34 +169,58 @@ pub fn list_listings(db: &Db) -> AppResult<Vec<ListingRow>> {
     })
 }
 
-/// A user-confirmed import line: merge into inventory (never clobber a larger manual count).
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct ImportApply {
-    pub slug: String,
-    pub qty: i64,
+/// How many rows the mirror currently holds — the honest number to report when a
+/// sync deliberately leaves the existing mirror in place.
+pub fn count_listings(db: &Db) -> AppResult<usize> {
+    db.read(|c| {
+        let n: i64 = c.query_row("SELECT COUNT(*) FROM market_listings", [], |r| r.get(0))?;
+        Ok(n as usize)
+    })
 }
 
-/// Transactional merge of confirmed import rows into inventory. Sets qty to the
-/// max of the existing count and the imported count. Marks new rows 'wfm_import'.
-pub fn apply_import(db: &Db, rows: &[ImportApply]) -> AppResult<usize> {
-    db.with_mut(|conn| {
-        let tx = conn.transaction()?;
-        let now = Utc::now().to_rfc3339();
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO inventory_items (slug, qty, first_added_at, last_modified_at, source)
-                 VALUES (?1, ?2, ?3, ?3, 'wfm_import')
-                 ON CONFLICT(slug) DO UPDATE SET
-                    qty = MAX(inventory_items.qty, ?2),
-                    last_modified_at = ?3",
-            )?;
-            for r in rows {
-                if r.qty > 0 {
-                    stmt.execute(params![r.slug, r.qty, now])?;
-                }
-            }
-        }
-        tx.commit()?;
-        Ok(rows.len())
-    })
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::testutil::{seed_item, test_db};
+
+    fn seed(db: &Db) {
+        seed_item(db, "a", "set", None);
+        let rows = [ListingMirror {
+            order_id: "o1".into(),
+            slug: "a".into(),
+            order_type: "sell".into(),
+            your_price: Some(10),
+            qty: 1,
+            visible: true,
+        }];
+        replace_listings(db, &rows, 1).unwrap();
+    }
+
+    /// The regression guard: fetching orders but matching none of them must not be
+    /// mistaken for "you have no orders".
+    #[test]
+    fn replace_listings_refuses_to_wipe_when_nothing_mapped() {
+        let db = test_db("wfm");
+        seed(&db);
+        assert!(replace_listings(&db, &[], 5).is_err());
+        assert_eq!(count_listings(&db).unwrap(), 1);
+    }
+
+    #[test]
+    fn replace_listings_accepts_a_genuine_empty() {
+        let db = test_db("wfm");
+        seed(&db);
+        assert_eq!(replace_listings(&db, &[], 0).unwrap(), 0);
+        assert_eq!(count_listings(&db).unwrap(), 0);
+    }
+
+    #[test]
+    fn account_roundtrip_keeps_name_and_slug_apart() {
+        let db = test_db("wfm");
+        set_account(&db, "Nadarejin", "nadarejin", Some("online")).unwrap();
+        let acct = get_account(&db).unwrap();
+        assert_eq!(acct.username.as_deref(), Some("Nadarejin"));
+        assert_eq!(acct.slug.as_deref(), Some("nadarejin"));
+        assert!(acct.connected);
+    }
 }

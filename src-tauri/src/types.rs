@@ -714,9 +714,13 @@ pub struct ItemDetail {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WfmAccount {
+    /// In-game name, spelled the way warframe.market spells it. Display only.
     pub username: Option<String>,
+    /// The warframe.market profile slug — what `/v2/orders/user/<…>` and
+    /// `/profile/<…>` take. NOT a lowercase of `username` (see `domain::wfm_slug`).
+    /// None on a pre-0022 install until the next connect/sync resolves it.
+    pub slug: Option<String>,
     pub status: Option<String>,
-    pub last_import_at: Option<String>,
     pub connected: bool,
     pub has_session: bool, // a JWT is stored in the keychain
     /// Session JWT expiry (rfc3339) and whether it's already past — from the
@@ -781,15 +785,16 @@ pub struct RepriceApply {
     pub visible: bool,
 }
 
-/// A reviewable import row (preview), before the user confirms it into inventory.
+/// What a listings sync actually did. `fetched` is what warframe.market returned,
+/// `mirrored` what the local table now holds, `untracked` the fetched orders whose
+/// item has no catalog row. Enough for the UI to tell "you have no open orders"
+/// apart from "we matched none of them" — the two used to look identical (both
+/// silently reported success).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImportRow {
-    pub slug: String,
-    pub display_name: String,
-    pub part_type: String,
-    pub listed_qty: i64,
-    pub your_price: Option<i64>,
-    pub current_qty: i64, // what inventory already has (conflict surface)
+pub struct SyncResult {
+    pub fetched: usize,
+    pub mirrored: usize,
+    pub untracked: usize,
 }
 
 // ---------------------------------------------------------------------------

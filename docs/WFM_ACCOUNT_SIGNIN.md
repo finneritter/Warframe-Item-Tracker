@@ -1,6 +1,39 @@
 # WFIT — warframe.market Account Sign-In (Listings Import)
 
-**Status:** Proposal · **Date:** 2026-05-30 · **Verified against the warframe.market v1 API surface 2026-05-30.**
+**Status:** Proposal (2026-05-30) — **shipped, and since diverged. Read §0 first;** the rest of this
+document is the original design record and is stale in the places §0 names.
+
+---
+
+## 0. Current state (2026-08-03) — what actually shipped
+
+Three things below are no longer true of the code:
+
+- **The API surface is v2, not v1.** Orders are `GET /v2/orders/user/<slug>`, the session check is
+  `GET /v2/me`, the profile is `GET /v2/user/<slug>`. Every `/v1/profile/…` path in this document is
+  dead. (Statistics remain v1 — see `DATA_SOURCING_MASTER_PLAN.md`.)
+- **A user is addressed by their profile SLUG, not their in-game name.** The endpoints are
+  case-sensitive and 404 on the name (`Nadarejin` → 404; `nadarejin` → 200). The slug is *not*
+  derivable: colliding names get an unguessable numeric suffix (`Deepsea_` → `deepsea-0265`) while the
+  obvious guess is a **different real account** (`deepsea` is `-DeepSea-`). So Tier 1 is no longer
+  "type your username" — `commands.rs::resolve_wfm_identity` resolves a candidate slug
+  (`domain::wfm_slug`) and accepts it **only** when the profile's own `ingameName` matches what the
+  user typed; a pasted profile URL is the authoritative escape hatch, and `/v2/me` short-circuits the
+  whole thing when a session exists. The resolved slug is persisted (`wfm_account.slug`, migration
+  0022) and every order call goes through it. Never re-derive it from the name.
+- **The listings → inventory import is gone.** `wfm_fetch_listings` / `wfm_apply_import` / `ImportRow`
+  / `ImportApply` / `mark_imported` and the review sheet in §4 and §5 no longer exist; `last_import_at`
+  is a vestigial column. Real inventory comes from the game memory scan (`GAME_INVENTORY_IMPORT.md`).
+  What remains is a **read-only mirror**: `wfm_sync_listings` → `market_listings`, returning a
+  `SyncResult { fetched, mirrored, untracked }` so "you have no open orders" is distinguishable from
+  "we matched none of them" — a sync that maps zero of N fetched orders refuses to clear the mirror.
+
+Still accurate: the tier model itself (Tier 1 public / Tier 2 pasted JWT / Tier 3 never), the JWT
+living in the OS keychain, and the principle that listings ≠ inventory.
+
+---
+
+**Original proposal follows.** · **Date:** 2026-05-30 · **Verified against the warframe.market v1 API surface 2026-05-30.**
 
 > **What this is:** an *optional* convenience feature that lets a user connect their warframe.market
 > account to import their **active orders (listings)** into WFIT. It is **not** in-game inventory sync.

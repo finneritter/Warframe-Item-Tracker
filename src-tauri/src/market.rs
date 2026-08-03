@@ -84,6 +84,20 @@ impl Market {
     /// grace so a rate-limit response isn't immediately hammered again.
     /// Idempotent public reads only — auth'd/write requests don't use this.
     async fn get_throttled(&self, url: &str) -> AppResult<reqwest::Response> {
+        self.get_throttled_req(self.http.get(url), url).await
+    }
+
+    /// As [`Market::get_throttled`], for a GET that needs extra headers — the
+    /// optional session JWT on the user-orders read. `url` is for logging only.
+    /// GETs have no body, so the `try_clone` for the retry always succeeds.
+    async fn get_throttled_req(
+        &self,
+        req: reqwest::RequestBuilder,
+        url: &str,
+    ) -> AppResult<reqwest::Response> {
+        let retry = req
+            .try_clone()
+            .ok_or_else(|| AppError::Other("GET not cloneable for retry".into()))?;
         self.throttled().await;
         // Dev fault injection (after the throttle, so serialization is preserved;
         // a no-op when the dev-dashboard feature is off). 1 = timeout, 2 = 429.
@@ -97,11 +111,11 @@ impl Market {
                 tracing::warn!(url, "injected fault: 429 — retrying once");
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 self.throttled().await;
-                return Ok(self.timed_send(url).await?);
+                return Ok(self.timed_send(retry).await?);
             }
             _ => {}
         }
-        let first = self.timed_send(url).await;
+        let first = self.timed_send(req).await;
         let transient = match &first {
             Ok(r) => r.status().as_u16() == 429 || r.status().is_server_error(),
             Err(e) => e.is_timeout() || e.is_connect(),
@@ -112,15 +126,15 @@ impl Market {
         tracing::warn!(url, "transient warframe.market failure — retrying once");
         tokio::time::sleep(Duration::from_secs(1)).await;
         self.throttled().await;
-        Ok(self.timed_send(url).await?)
+        Ok(self.timed_send(retry).await?)
     }
 
     /// A single GET, timing ONLY `send().await` (never the throttle wait) and
     /// recording latency/status to the dev metrics. The recorder is a no-op when
-    /// the `dev-dashboard` feature is off, so this is just `get(url).send()` then.
-    async fn timed_send(&self, url: &str) -> reqwest::Result<reqwest::Response> {
+    /// the `dev-dashboard` feature is off, so this is just `req.send()` then.
+    async fn timed_send(&self, req: reqwest::RequestBuilder) -> reqwest::Result<reqwest::Response> {
         let t = Instant::now();
-        let res = self.http.get(url).send().await;
+        let res = req.send().await;
         let elapsed = t.elapsed();
         let (status, is_err) = match &res {
             Ok(r) => (Some(r.status().as_u16()), !r.status().is_success()),
@@ -382,9 +396,6 @@ impl Market {
             value: f64,
             #[serde(default)]
             positive: bool,
-        }
-        fn default_true() -> bool {
-            true
         }
 
         let url = format!(
@@ -796,9 +807,6 @@ impl Market {
             reputation: Option<i64>,
             status: Option<String>,
         }
-        fn default_true() -> bool {
-            true
-        }
 
         let url = format!("{API_V2}/orders/item/{slug}");
         let r = self.get_throttled(&url).await?;
@@ -903,46 +911,98 @@ impl Market {
         })
     }
 
-    /// Tier 1 (public): a user's visible orders. Auth header optional (Tier 2).
+    /// Public profile lookup: `GET /v2/user/<slug>`. `Ok(None)` on a 404 —
+    /// "no profile with that slug" is an answer, not a failure. Any other non-2xx
+    /// is an error. Used to resolve (and verify) an account's profile slug.
+    pub async fn fetch_user(&self, slug: &str) -> AppResult<Option<WfmUser>> {
+        #[derive(Deserialize)]
+        struct Resp {
+            data: WfmUser,
+        }
+        let url = format!("{API_V2}/user/{slug}");
+        let r = self.get_throttled(&url).await?;
+        let status = r.status();
+        if status.as_u16() == 404 {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            tracing::warn!(slug, status = status.as_u16(), "profile lookup failed");
+            return Err(AppError::Other(format!(
+                "warframe.market returned {status} looking up the profile \"{slug}\""
+            )));
+        }
+        Ok(Some(r.json::<Resp>().await?.data))
+    }
+
+    /// A user's orders. `slug` is the warframe.market **profile slug** (the `slug`
+    /// of `GET /v2/user/…`), NOT the in-game name — the endpoint is case-sensitive
+    /// and 404s on the name. Auth header optional; with it, invisible orders are
+    /// included too (Tier 2).
+    ///
+    /// Fails loudly: a non-2xx is an `Err`, never an empty Vec. Swallowing the 404
+    /// is what made a mis-cased name look like "you have no listings" — and then
+    /// wiped the local mirror — for every affected user since v1.1.
     pub async fn fetch_user_orders(
         &self,
-        username: &str,
+        slug: &str,
         jwt: Option<&str>,
     ) -> AppResult<Vec<RawOrder>> {
-        self.throttled().await;
-
         #[derive(Deserialize)]
         struct Resp {
             #[serde(default)]
             data: Vec<RawOrder>,
         }
 
-        let url = format!("{API_V2}/orders/user/{username}");
-        let mut req = self.http.get(url);
+        let url = format!("{API_V2}/orders/user/{slug}");
+        let mut req = self.http.get(&url);
         if let Some(token) = jwt {
             req = req
                 .header("Authorization", format!("JWT {token}"))
                 .header("Cookie", format!("JWT={token}"));
         }
-        let r = req.send().await?;
-        if !r.status().is_success() {
-            return Ok(Vec::new());
+        let r = self.get_throttled_req(req, &url).await?;
+        let status = r.status();
+        if !status.is_success() {
+            tracing::warn!(slug, status = status.as_u16(), "user-orders fetch failed");
+            return Err(match status.as_u16() {
+                401 | 403 => AppError::Other(
+                    "warframe.market rejected your session — reconnect your account.".into(),
+                ),
+                404 => AppError::NotFound(format!(
+                    "warframe.market has no profile \"{slug}\". Disconnect and reconnect \
+                     so WFIT can re-resolve it."
+                )),
+                429 => AppError::Other(
+                    "warframe.market is rate-limiting us — try again in a minute.".into(),
+                ),
+                _ => AppError::Other(format!("warframe.market returned {status} for your orders")),
+            });
         }
-        let resp: Resp = r.json().await?;
-        Ok(resp.data)
+        Ok(r.json::<Resp>().await?.data)
     }
 
-    /// Validate a session token against an authenticated endpoint (`GET /v2/me`).
-    /// Returns the body text on failure so the caller can surface the real reason.
-    pub async fn fetch_me(&self, jwt: &str) -> AppResult<()> {
+    /// Validate a session token against an authenticated endpoint (`GET /v2/me`)
+    /// and hand back the profile it describes — the authoritative slug, with no
+    /// guessing. `Ok(None)` when the call succeeds but the body isn't a shape we
+    /// recognise: `/v2/me` is undocumented, and an envelope change must degrade to
+    /// "fall back to the public lookup", not break signing in. A rejected token is
+    /// still an `Err` (`send_checked` maps 401/403 to a reconnect message).
+    pub async fn fetch_me(&self, jwt: &str) -> AppResult<Option<WfmUser>> {
         self.throttled().await;
         let req = self
             .http
             .get(format!("{API_V2}/me"))
             .header("Authorization", format!("JWT {jwt}"))
             .header("Cookie", format!("JWT={jwt}"));
-        self.send_checked(req).await?;
-        Ok(())
+        let r = self.send_checked(req).await?;
+        let body: serde_json::Value = match r.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "/v2/me body wasn't JSON");
+                return Ok(None);
+            }
+        };
+        Ok(extract_user(&body))
     }
 
     /// Create an order (Tier 2 — requires a session JWT). Returns the created order.
@@ -1152,13 +1212,52 @@ pub struct RawOrder {
     pub order_type: String,
     pub platinum: Option<i64>,
     pub quantity: Option<i64>,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub visible: bool,
     #[serde(rename = "itemId")]
     pub item_id: String,
     /// Present for ranked goods (mods/arcanes); absent → non-ranked.
     #[serde(default)]
     pub rank: Option<i64>,
+}
+
+/// serde default for an order's `visible`. Live responses always carry the field,
+/// so an order arriving without it means the payload shape changed — far likelier
+/// than a genuinely hidden order. Defaulting to `false` would silently mark every
+/// mirrored listing hidden (dimmed rows, wrong "at best price" counts).
+fn default_true() -> bool {
+    true
+}
+
+/// Pull a [`WfmUser`] out of an undocumented `/v2/me` body: it may sit at `data`,
+/// at `data.user`, or at the root. `None` (never an error) when it's none of those,
+/// so an envelope change costs us the slug shortcut and nothing else.
+fn extract_user(v: &serde_json::Value) -> Option<WfmUser> {
+    let data = v.get("data");
+    for candidate in [data.and_then(|d| d.get("user")), data, Some(v)] {
+        let parsed = candidate.and_then(|c| serde_json::from_value::<WfmUser>(c.clone()).ok());
+        if let Some(u) = parsed.filter(|u| !u.slug.is_empty()) {
+            return Some(u);
+        }
+    }
+    None
+}
+
+/// A warframe.market user profile — the `data` of `GET /v2/user/<slug>` and (best
+/// effort) of `GET /v2/me`. Only the fields WFIT uses are modelled; the payload also
+/// carries id/role/tier/about/reputation/masteryRank/activity/lastSeen/crossplay.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WfmUser {
+    /// The in-game name, as warframe.market spells it. Display only.
+    #[serde(rename = "ingameName")]
+    pub ingame_name: String,
+    /// The value that goes in `/v2/orders/user/<here>`. Case-sensitive, and NOT a
+    /// lowercase of `ingame_name` — see `domain::wfm_slug`.
+    pub slug: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub platform: Option<String>,
 }
 
 fn avg(xs: &[f64]) -> f64 {
@@ -1327,5 +1426,59 @@ mod tests {
         assert_eq!(robust_low(&[]), None);
         assert_eq!(robust_low(&[5]), Some(5));
         assert_eq!(robust_low(&[1, 1, 1, 1]), Some(1)); // disruptor-style 1p floor
+    }
+
+    /// An order object without `visible` means the payload shape changed, not that
+    /// the order is hidden. Defaulting to false dimmed every mirrored row.
+    #[test]
+    fn raw_order_visible_defaults_true() {
+        let o: RawOrder =
+            serde_json::from_str(r#"{"id":"1","type":"sell","itemId":"abc"}"#).unwrap();
+        assert!(o.visible);
+        let hidden: RawOrder =
+            serde_json::from_str(r#"{"id":"1","type":"sell","itemId":"abc","visible":false}"#)
+                .unwrap();
+        assert!(!hidden.visible);
+    }
+
+    /// The real `GET /v2/user/nadarejin` body (2026-08-03), trimmed. Pins the
+    /// `ingameName` rename and the fact that the slug is a separate field.
+    #[test]
+    fn wfm_user_parses_the_v2_user_payload() {
+        let body = serde_json::json!({
+            "id": "5627080eb66f83150b203df3",
+            "role": "user",
+            "tier": "none",
+            "ingameName": "Nadarejin",
+            "slug": "nadarejin",
+            "about": "<p>Leave a +REP if you please :D</p>",
+            "reputation": 39,
+            "masteryRank": 0,
+            "status": "offline",
+            "platform": "pc",
+            "crossplay": true,
+            "locale": "en"
+        });
+        let u: WfmUser = serde_json::from_value(body).unwrap();
+        assert_eq!(u.ingame_name, "Nadarejin");
+        assert_eq!(u.slug, "nadarejin");
+        assert_eq!(u.status.as_deref(), Some("offline"));
+    }
+
+    /// `/v2/me` is undocumented: accept every envelope we might plausibly get, and
+    /// return None (never an error) for one we don't recognise.
+    #[test]
+    fn extract_user_handles_every_me_envelope() {
+        let user = serde_json::json!({ "ingameName": "Nadarejin", "slug": "nadarejin" });
+        for body in [
+            user.clone(),
+            serde_json::json!({ "data": user.clone() }),
+            serde_json::json!({ "data": { "user": user.clone() } }),
+        ] {
+            assert_eq!(extract_user(&body).unwrap().slug, "nadarejin");
+        }
+        assert!(extract_user(&serde_json::json!({ "ok": true })).is_none());
+        // A user object without a usable slug is as good as no answer.
+        assert!(extract_user(&serde_json::json!({ "ingameName": "X", "slug": "" })).is_none());
     }
 }

@@ -739,16 +739,10 @@ export function useWfmSync() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: () => api.wfmSyncListings(),
-    onSuccess: () => qc.invalidateQueries({ queryKey: keys.listings }),
-  });
-}
-export function useWfmApplyImport() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (rows: { slug: string; qty: number }[]) => api.wfmApplyImport(rows),
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: keys.listings });
+      // A sync may have resolved and stored the profile slug (pre-0022 installs).
       qc.invalidateQueries({ queryKey: keys.wfmAccount });
-      invalidateInventoryDerived(qc);
     },
   });
 }

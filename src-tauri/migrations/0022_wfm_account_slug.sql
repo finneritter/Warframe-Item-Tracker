@@ -1,0 +1,27 @@
+-- ----------------------------------------------------------------------------
+-- warframe.market addresses a user by their profile SLUG, not their in-game name.
+-- `GET /v2/orders/user/<slug>` and `GET /v2/user/<slug>` are case-sensitive and 404
+-- on the name (verified 2026-08-03: "nadarejin" -> 200 with 72 orders, "Nadarejin"
+-- -> 404 app.user.notFound; the user id is not accepted either). `fetch_user_orders`
+-- turned that 404 into Ok(vec![]), so a mis-cased name connected fine and then synced
+-- zero listings forever — the beta report this column exists to fix.
+--
+-- The slug is NOT derivable from the name. It is lowercased with runs of
+-- non-alphanumerics collapsed to '-', BUT collisions get a numeric suffix nobody can
+-- guess, and the obvious guess belongs to someone else. Verified pairs:
+--     "Deepsea_"  -> deepsea-0265      while  slug "deepsea" is "-DeepSea-"
+--     "---T_T---" -> t-t-4617                 "Spider__Sense" -> spider-sense
+-- So it must be RESOLVED once against GET /v2/user/<candidate> and accepted only when
+-- the returned ingameName matches what the user typed (commands.rs::resolve_wfm_identity).
+--
+-- NULL = a pre-0022 install (or the dev simulator): resolved lazily and verified on
+-- the next connect/sync (commands.rs::connected_slug). Deliberately NOT backfilled
+-- with `slug = username` here — that would silently point the affected cohort at a
+-- stranger's order book, which is worse than syncing nothing.
+--
+-- NOTE: last_import_at is left in place but is now vestigial — the listings->inventory
+-- import it timestamped is gone (the game memory scan is the real inventory path, see
+-- docs/GAME_INVENTORY_IMPORT.md). Not dropped: rewriting a table to remove a nullable
+-- column is all risk and no gain.
+-- ----------------------------------------------------------------------------
+ALTER TABLE wfm_account ADD COLUMN slug TEXT;

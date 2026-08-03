@@ -17,7 +17,6 @@ import type {
   GameDataUpdate,
   GameScanStatus,
   GearRow,
-  ImportRow,
   InventoryRow,
   ItemDetail,
   ItemOrders,
@@ -46,6 +45,7 @@ import type {
   SimSummary,
   StartupStatus,
   Summary,
+  SyncResult,
   TrendsData,
   UpdateStatus,
   VendorPanel,
@@ -223,11 +223,8 @@ export const getWfmAccount = () => invoke<WfmAccount>("get_wfm_account");
 export const wfmConnect = (username: string) => invoke<WfmAccount>("wfm_connect", { username });
 export const wfmSetSession = (jwt: string) => invoke<WfmAccount>("wfm_set_session", { jwt });
 export const wfmSignout = () => invoke<void>("wfm_signout");
-export const wfmSyncListings = () => invoke<number>("wfm_sync_listings");
+export const wfmSyncListings = () => invoke<SyncResult>("wfm_sync_listings");
 export const wfmGetListings = () => invoke<ListingRow[]>("wfm_get_listings");
-export const wfmFetchListings = () => invoke<ImportRow[]>("wfm_fetch_listings");
-export const wfmApplyImport = (rows: { slug: string; qty: number }[]) =>
-  invoke<number>("wfm_apply_import", { rows });
 export const wfmCreateOrder = (args: {
   slug: string;
   platinum: number;
