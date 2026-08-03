@@ -2,11 +2,14 @@
 // prices/ownership, and the set-vs-parts economics. Opens from any row in the
 // Sets table; part names click through to the item Drawer (owned) or straight to
 // the Market screen (missing = "buy this" cue), stacking like the RelicDrawer.
+// The header carries the one external link: the *set's* warframe.market page (the
+// parts each have their own; the assembled set didn't until a beta report asked).
 import { useSets } from "../hooks/queries";
 import { useDrawerResize } from "../hooks/useDrawerResize";
 import { useEscape } from "../hooks/useEscape";
 import { clsx, fmt } from "../lib/format";
 import type { SetRow } from "../lib/types";
+import { openMarketExternal } from "../lib/wiki";
 import type { ScreenId } from "./Sidebar";
 import { Scrim } from "./ui";
 
@@ -94,8 +97,19 @@ export function SetDrawer({
                 </span>
               ) : null}
             </div>
+            {/* The market link lives INSIDE .sub on purpose: `.lnk` is declared later in
+                theme.css with equal specificity, so its `font: inherit` only resolves to
+                this line's 11.5px when it's nested. */}
             <div className="sub">
-              {row.category} · {row.owned_parts}/{row.total_parts} parts owned
+              {row.category} · {row.owned_parts}/{row.total_parts} parts owned ·{" "}
+              <button
+                type="button"
+                className="lnk"
+                title="Open the full set's warframe.market page in your browser"
+                onClick={() => openMarketExternal(row.set_slug)}
+              >
+                warframe.market ↗
+              </button>
             </div>
           </div>
           <button type="button" className="x" onClick={onClose}>
