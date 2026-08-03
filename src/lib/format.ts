@@ -94,9 +94,11 @@ export const syncedAgo = (iso: string | null): string => {
  *  broken Sync look like an idle one. */
 export const syncListingsNote = (r: SyncResult): string => {
   const s = (n: number) => (n === 1 ? "" : "s");
+  if (r.kept)
+    return r.fetched === 0
+      ? `warframe.market showed no orders, but without a connected session it can only see your visible ones — your ${r.mirrored} listing${s(r.mirrored)} were left as they were. Connect a session to be sure.`
+      : `warframe.market returned ${r.fetched} order${s(r.fetched)}, none of them items WFIT tracks — your listings were left as they were`;
   if (r.fetched === 0) return "No open orders on warframe.market";
-  if (r.mirrored === 0)
-    return `warframe.market returned ${r.fetched} order${s(r.fetched)}, none of them items WFIT tracks — your listings were left as they were`;
   const base = `Synced ${r.mirrored} listing${s(r.mirrored)}`;
   return r.untracked > 0 ? `${base} · ${r.untracked} not tracked by WFIT` : base;
 };

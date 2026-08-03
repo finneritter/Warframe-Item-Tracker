@@ -371,6 +371,9 @@ export interface SyncResult {
   fetched: number;
   mirrored: number;
   untracked: number;
+  /** The existing mirror was left in place because the fetch wasn't trustworthy
+   *  enough to replace it. `mirrored` is then what was already there. */
+  kept: boolean;
 }
 
 export interface RecommendationRow {

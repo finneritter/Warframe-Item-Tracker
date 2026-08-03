@@ -1665,11 +1665,37 @@ pub async fn wfm_sync_listings(state: State<'_, Arc<AppState>>) -> AppResult<Syn
 pub(crate) async fn sync_listings_impl(state: &Arc<AppState>) -> AppResult<SyncResult> {
     let slug = connected_slug(state).await?;
     let jwt = wfm_account::load_jwt()?;
+    let had_session = jwt.is_some();
     let orders = state
         .market
         .fetch_user_orders(&slug, jwt.as_deref())
         .await?;
     let fetched = orders.len();
+
+    // Without a session, warframe.market returns only your *visible* orders, so an
+    // account whose orders are all invisible answers 200 with an empty list —
+    // indistinguishable from genuinely having none. Wiping a non-empty mirror on
+    // that is the same silent emptying the rest of this function exists to prevent
+    // (and the heartbeat re-syncs every ~10 min, so an expired token would take the
+    // listings with it unprompted). With a session the zero IS authoritative,
+    // because invisible orders are included. Verified 2026-08-03: bigfinnn returns
+    // 8 orders with a token and 0 without, while offline-but-visible profiles
+    // return theirs publicly — "offline" is not what hides them.
+    if fetched == 0 && !had_session {
+        let existing = wfm::count_listings(&state.db)?;
+        if existing > 0 {
+            tracing::warn!(
+                %slug, existing,
+                "no orders on the public endpoint and no session — mirror left untouched"
+            );
+            return Ok(SyncResult {
+                fetched: 0,
+                mirrored: existing,
+                untracked: 0,
+                kept: true,
+            });
+        }
+    }
 
     // Resolve warframe.market item ids -> our catalog slugs; drop untracked items.
     let id_to_slug = catalog::id_slug_map(&state.db)?;
@@ -1713,6 +1739,7 @@ pub(crate) async fn sync_listings_impl(state: &Arc<AppState>) -> AppResult<SyncR
             fetched,
             mirrored: wfm::count_listings(&state.db)?,
             untracked,
+            kept: true,
         });
     }
     let mirrored = wfm::replace_listings(&state.db, &mirror, fetched)?;
@@ -1720,6 +1747,7 @@ pub(crate) async fn sync_listings_impl(state: &Arc<AppState>) -> AppResult<SyncR
         fetched,
         mirrored,
         untracked,
+        kept: false,
     })
 }
 

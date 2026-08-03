@@ -206,6 +206,11 @@ mod tests {
         assert_eq!(count_listings(&db).unwrap(), 1);
     }
 
+    /// `fetched == 0` wipes — but only the CALLER can tell a genuine zero from an
+    /// unauthenticated read that simply couldn't see invisible orders. That check
+    /// lives in `commands::sync_listings_impl` (the `had_session` guard); this layer
+    /// trusts the count it is handed, so don't reintroduce a bare `replace_listings`
+    /// call on a public fetch.
     #[test]
     fn replace_listings_accepts_a_genuine_empty() {
         let db = test_db("wfm");

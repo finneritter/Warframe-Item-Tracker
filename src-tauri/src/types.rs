@@ -795,6 +795,11 @@ pub struct SyncResult {
     pub fetched: usize,
     pub mirrored: usize,
     pub untracked: usize,
+    /// The existing mirror was deliberately left in place because the fetch wasn't
+    /// trustworthy enough to replace it — either every order was untracked, or the
+    /// public endpoint returned nothing while we had no session to see invisible
+    /// orders with. `mirrored` is then what the mirror already held, not new work.
+    pub kept: bool,
 }
 
 // ---------------------------------------------------------------------------
