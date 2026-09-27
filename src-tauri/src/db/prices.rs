@@ -547,8 +547,44 @@ pub fn upsert_many(db: &Db, prices: &[PriceUpsert], ttl: Duration) -> AppResult<
                 }
             }
         }
+        {
+            // A real price supersedes any earlier "no data" verdict.
+            let mut miss_stmt = tx.prepare("DELETE FROM price_miss WHERE slug = ?1")?;
+            for p in prices {
+                miss_stmt.execute(params![p.slug])?;
+            }
+        }
         tx.commit()?;
         Ok(prices.len())
+    })
+}
+
+/// Record statistics fetches that yielded no usable price (brand-new item with an
+/// empty 90-day series, or a non-2xx) so the staleness queries skip them until
+/// `ttl` passes. Without this the slug never gets a `price_cache` row and every
+/// drain batch / heartbeat tick re-picks it forever.
+pub fn mark_missing(db: &Db, slugs: &[String], ttl: Duration) -> AppResult<()> {
+    if slugs.is_empty() {
+        return Ok(());
+    }
+    db.with_mut(|conn| {
+        let tx = conn.transaction()?;
+        let now = Utc::now();
+        let checked_at = now.to_rfc3339();
+        let expires_at = (now + ttl).to_rfc3339();
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO price_miss (slug, checked_at, expires_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(slug) DO UPDATE SET
+                    checked_at = excluded.checked_at,
+                    expires_at = excluded.expires_at",
+            )?;
+            for slug in slugs {
+                stmt.execute(params![slug, checked_at, expires_at])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     })
 }
 
@@ -571,12 +607,15 @@ pub fn slugs_older_than(db: &Db, table: &str, cutoff: &str, limit: i64) -> AppRe
         let sql = format!(
             "SELECT t.slug FROM {table} t
              LEFT JOIN price_cache pc ON pc.slug = t.slug
-             WHERE pc.slug IS NULL OR pc.fetched_at < ?1
+             WHERE (pc.slug IS NULL OR pc.fetched_at < ?1) 
+               AND NOT EXISTS (SELECT 1 FROM price_miss pm
+                               WHERE pm.slug = t.slug AND pm.expires_at >= ?3)
              ORDER BY pc.fetched_at IS NOT NULL, pc.fetched_at ASC
              LIMIT ?2"
         );
         let mut stmt = c.prepare(&sql)?;
-        let rows = stmt.query_map(params![cutoff, limit], |r| r.get::<_, String>(0))?;
+        let now = Utc::now().to_rfc3339();
+        let rows = stmt.query_map(params![cutoff, limit, now], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -591,7 +630,9 @@ fn stale_for(db: &Db, table: &str) -> AppResult<Vec<String>> {
         let sql = format!(
             "SELECT t.slug FROM {table} t
              LEFT JOIN price_cache pc ON pc.slug = t.slug
-             WHERE pc.slug IS NULL OR pc.expires_at < ?1"
+             WHERE (pc.slug IS NULL OR pc.expires_at < ?1) 
+               AND NOT EXISTS (SELECT 1 FROM price_miss pm
+                               WHERE pm.slug = t.slug AND pm.expires_at >= ?1)"
         );
         let mut stmt = c.prepare(&sql)?;
         let rows = stmt.query_map(params![now], |r| r.get::<_, String>(0))?;
@@ -611,7 +652,9 @@ pub fn stale_catalog_slugs(db: &Db, limit: i64) -> AppResult<Vec<String>> {
         let mut stmt = c.prepare(
             "SELECT ci.slug FROM catalog_items ci
              LEFT JOIN price_cache pc ON pc.slug = ci.slug
-             WHERE pc.slug IS NULL OR pc.expires_at < ?1
+             WHERE (pc.slug IS NULL OR pc.expires_at < ?1)
+               AND NOT EXISTS (SELECT 1 FROM price_miss pm
+                               WHERE pm.slug = ci.slug AND pm.expires_at >= ?1)
              ORDER BY pc.fetched_at IS NOT NULL, pc.fetched_at ASC
              LIMIT ?2",
         )?;
@@ -669,6 +712,61 @@ mod tests {
         )
         .unwrap();
         c
+    }
+
+    // Regression (drain never finished): a slug whose statistics came back empty
+    // (brand-new item, no closed trades) got no price_cache row, so every drain
+    // batch re-picked it forever. A miss must hide it until the TTL passes, and a
+    // later real price must clear the miss.
+    #[test]
+    fn missing_stats_leave_the_stale_queue() {
+        use crate::db::testutil::{seed_item, test_db};
+        let db = test_db("price-miss");
+        seed_item(&db, "fresh_mod", "mod", None);
+        seed_item(&db, "priced_part", "warframe", Some(10));
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO inventory_items (slug, qty, first_added_at, last_modified_at)
+                 VALUES ('fresh_mod', 1, 'x', 'x')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(stale_catalog_slugs(&db, 40).unwrap(), vec!["fresh_mod"]);
+
+        mark_missing(&db, &["fresh_mod".to_string()], Duration::hours(6)).unwrap();
+        assert!(stale_catalog_slugs(&db, 40).unwrap().is_empty());
+        assert!(stale_inventory_slugs(&db).unwrap().is_empty());
+        let far_future = (Utc::now() + Duration::days(1)).to_rfc3339();
+        assert!(slugs_older_than(&db, "inventory_items", &far_future, 40)
+            .unwrap()
+            .iter()
+            .all(|s| s != "fresh_mod"));
+
+        // An expired miss is retried.
+        mark_missing(&db, &["fresh_mod".to_string()], Duration::hours(-1)).unwrap();
+        assert_eq!(stale_catalog_slugs(&db, 40).unwrap(), vec!["fresh_mod"]);
+
+        // A real price clears the miss row.
+        upsert_many(
+            &db,
+            &[PriceUpsert {
+                slug: "fresh_mod".into(),
+                median_plat: 200,
+                trend: "flat".into(),
+                delta_7d: None,
+                volume_7d: None,
+                history: vec![],
+                ranks: vec![],
+            }],
+            Duration::hours(6),
+        )
+        .unwrap();
+        let n: i64 = db
+            .with(|c| Ok(c.query_row("SELECT COUNT(*) FROM price_miss", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     // The recommended-price rule must undercut a healthy live floor but refuse to

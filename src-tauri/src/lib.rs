@@ -575,7 +575,7 @@ pub(crate) async fn launch_refresh(state: Arc<AppState>) -> error::AppResult<()>
         tracing::info!("pricing logic changed → clearing price caches for a clean reprice");
         state.db.with(|c| {
             c.execute_batch(
-                "DELETE FROM price_cache; DELETE FROM price_rank; DELETE FROM order_cache; DELETE FROM buy_orders; DELETE FROM order_fetch_meta;",
+                "DELETE FROM price_cache; DELETE FROM price_rank; DELETE FROM order_cache; DELETE FROM buy_orders; DELETE FROM order_fetch_meta; DELETE FROM price_miss;",
             )?;
             Ok(())
         })?;
@@ -733,11 +733,29 @@ pub(crate) async fn launch_refresh(state: Arc<AppState>) -> error::AppResult<()>
     }
 
     // 4) Background drain of everything else, oldest-first, batch by batch.
+    // Each slug is attempted at most once per drain: a fetch that errors leaves
+    // the slug stale, and re-picking it would spin forever with the "syncing…"
+    // flag held (which also starves the heartbeat). Those retry on a later tick.
+    // `skip` widens the query past already-attempted slugs still at the front.
+    let mut attempted = std::collections::HashSet::new();
+    let mut skip = 0usize;
     loop {
-        let batch = prices::stale_catalog_slugs(&state.db, DRAIN_BATCH)?;
+        let limit = DRAIN_BATCH as usize + skip;
+        let stale = prices::stale_catalog_slugs(&state.db, limit as i64)?;
+        let full = stale.len() == limit;
+        let n = stale.len();
+        let batch: Vec<String> = stale
+            .into_iter()
+            .filter(|s| !attempted.contains(s))
+            .collect();
+        skip = n - batch.len();
         if batch.is_empty() {
+            if full {
+                continue; // the window was all retries-in-waiting; look further
+            }
             break;
         }
+        attempted.extend(batch.iter().cloned());
         refresh_slugs(&state, &batch).await?;
         meta::set(
             &state.db,
@@ -851,10 +869,13 @@ async fn heartbeat_tick(state: &Arc<AppState>) -> error::AppResult<usize> {
 async fn refresh_slugs(state: &Arc<AppState>, slugs: &[String]) -> error::AppResult<()> {
     use db::prices;
     let mut updates = Vec::new();
+    let mut misses = Vec::new();
     for slug in slugs {
         match state.market.fetch_statistics(slug).await {
             Ok(Some(p)) => updates.push(p),
-            Ok(None) => {}
+            // Answered but nothing to price (no closed trades yet / non-2xx):
+            // negative-cache it so the staleness queries stop re-picking it.
+            Ok(None) => misses.push(slug.clone()),
             Err(e) => tracing::warn!(slug, error = %e, "fetch_statistics failed"),
         }
         // Persist in small chunks so progress survives and the UI sees data early.
@@ -865,6 +886,10 @@ async fn refresh_slugs(state: &Arc<AppState>, slugs: &[String]) -> error::AppRes
     }
     if !updates.is_empty() {
         prices::upsert_many(&state.db, &updates, Duration::hours(PRICE_TTL_HOURS))?;
+    }
+    if !misses.is_empty() {
+        tracing::info!(n = misses.len(), "no statistics yet; skipping until retry");
+        prices::mark_missing(&state.db, &misses, Duration::hours(PRICE_TTL_HOURS))?;
     }
     Ok(())
 }
