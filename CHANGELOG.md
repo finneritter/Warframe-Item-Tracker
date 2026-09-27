@@ -3,6 +3,16 @@
 All notable changes to WFIT are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.7.1] — 2026-09-27 · Windows starts again
+
+- **Fixed: WFIT could refuse to start on Windows** with "Database failed
+  to open — startup state missing (setup did not run?)" (#4). Nothing was
+  wrong with the database. On Windows the app's window could finish
+  loading a moment before the backend had finished starting up, and it
+  took that brief "not ready yet" as a failure. The window now waits for
+  startup to actually finish. If you hit this, just update — your data
+  was never touched, so there's no need to reset anything.
+
 ## [1.7.0] — 2026-08-03 · listings sync tells you the truth
 
 - **Connecting your warframe.market account works for everyone now.**
