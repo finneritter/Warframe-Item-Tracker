@@ -2389,6 +2389,11 @@ pub fn clear_simulated_inventory(state: State<'_, Arc<AppState>>) -> AppResult<(
 #[derive(serde::Serialize)]
 pub struct StartupStatus {
     pub ok: bool,
+    /// Setup hasn't managed AppState or RecoveryInfo *yet*. Tauri creates the
+    /// config windows before running the setup hook, and on Windows each
+    /// WebView2 build pumps the message loop — so the main page can load and
+    /// ask before setup has run (issue #4). The frontend polls until false.
+    pub pending: bool,
     pub error: Option<String>,
     pub db_path: Option<String>,
 }
@@ -2400,6 +2405,7 @@ pub fn startup_status(app: tauri::AppHandle) -> StartupStatus {
     if app.try_state::<Arc<AppState>>().is_some() {
         return StartupStatus {
             ok: true,
+            pending: false,
             error: None,
             db_path: None,
         };
@@ -2407,12 +2413,14 @@ pub fn startup_status(app: tauri::AppHandle) -> StartupStatus {
     match app.try_state::<crate::RecoveryInfo>() {
         Some(r) => StartupStatus {
             ok: false,
+            pending: false,
             error: Some(r.error.clone()),
             db_path: Some(r.db_path.display().to_string()),
         },
         None => StartupStatus {
             ok: false,
-            error: Some("startup state missing (setup did not run?)".into()),
+            pending: true,
+            error: None,
             db_path: None,
         },
     }

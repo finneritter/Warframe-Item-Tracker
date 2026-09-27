@@ -792,6 +792,8 @@ export interface Invasion {
 // Startup health + DB backups
 export interface StartupStatus {
   ok: boolean;
+  /** Backend setup hasn't finished yet — poll again (issue #4). */
+  pending?: boolean;
   error: string | null;
   db_path: string | null;
 }
