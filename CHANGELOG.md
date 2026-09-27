@@ -3,6 +3,17 @@
 All notable changes to WFIT are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.7.2] — 2026-09-27 · price sync finishes again
+
+- **Fixed: "syncing prices…" could get stuck forever on the last few items**
+  (e.g. "2,622 / 2,631 priced"), with the sync timer resetting every few
+  seconds and surviving restarts. A handful of items have no completed trades
+  on warframe.market in the last 90 days: brand-new ones like Piercing Fury,
+  and long-untraded ones like the Purgator 1 and EFV-8 Mars parts. The app kept
+  re-checking them without end, which also kept your other prices from
+  refreshing in the background. It now notes "no data yet" and checks those
+  items again a few hours later.
+
 ## [1.7.1] — 2026-09-27 · Windows starts again
 
 - **Fixed: WFIT could refuse to start on Windows** with "Database failed
